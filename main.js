@@ -77,8 +77,9 @@ const axonVertexShader = `
 
     uniform float u_neuronPulseStateStart; // 0.0 to 1.0
     uniform float u_neuronPulseStateEnd;   // 0.0 to 1.0
-    uniform float u_swellIntensity;        // e.g., 0.1 to 0.5
-    uniform float u_swellFalloff;          // e.g., 0.2 (20% of axon length)
+    uniform float u_swellIntensity;        // Max factor for radial swell
+    uniform float u_swellFalloff;          // How far the swell extends along the axon (0 to 1)
+    uniform float u_stretchIntensity;      // Max factor for longitudinal stretch (currently unused but planned)
 
     void main() {
         vUv = uv;
@@ -86,24 +87,55 @@ const axonVertexShader = `
         float distFromStart = vUv.y;
         float distFromEnd = 1.0 - vUv.y;
         float currentSwellFactor = 0.0;
+        // float currentStretchFactor = 0.0; // For longitudinal stretch, if implemented
 
-        // Corrected smoothstep logic:
-        // smoothstep(edge0, edge1, x) gives 0 if x < edge0, 1 if x > edge1, and smooth transition between.
-        // We want influence to be 1.0 at the very start/end (dist = 0) and 0.0 at u_swellFalloff.
+        // Enhanced Swelling/Stretching at the START of the axon (connected to neuronA)
         if (distFromStart < u_swellFalloff) {
-            float localInfluence = 1.0 - smoothstep(0.0, u_swellFalloff, distFromStart);
-            currentSwellFactor += u_neuronPulseStateStart * localInfluence;
+            // Sharper falloff for a more "pulled" look at the immediate connection point
+            float influence = pow(1.0 - smoothstep(0.0, u_swellFalloff, distFromStart), 2.0); 
+            currentSwellFactor += u_neuronPulseStateStart * influence;
         }
+
+        // Enhanced Swelling/Stretching at the END of the axon (connected to neuronB)
         if (distFromEnd < u_swellFalloff) {
-            float localInfluence = 1.0 - smoothstep(0.0, u_swellFalloff, distFromEnd);
-            currentSwellFactor += u_neuronPulseStateEnd * localInfluence;
+            float influence = pow(1.0 - smoothstep(0.0, u_swellFalloff, distFromEnd), 2.0);
+            currentSwellFactor += u_neuronPulseStateEnd * influence;
         }
+        
         currentSwellFactor = clamp(currentSwellFactor, 0.0, 1.0);
 
-        // The 'normal' attribute for our custom tube points radially outwards.
-        // So, displacing along the normal scales the radius.
         vec3 displacedPosition = position + normal * currentSwellFactor * u_swellIntensity;
         
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(displacedPosition, 1.0);
+            // This is a simplification; true tangent would be better but harder to get here without more attributes.
+            // We'll use a simple heuristic: pull "away" from the neuron.
+            // Since vUv.y = 0 is start, we want to displace in -Z direction of the tube segment IF Three.js orients tubes this way.
+            // However, our custom tube is built along curve tangents. Displacement along 'normal' is radial.
+            // For stretch, we'd ideally want to displace the *connection point itself* further from neuron center,
+            // or displace vertices near connection point along axon tangent.
+            // Given current setup, a simple radial swell is more robust. Let's enhance that.
+        }
+
+        // Swelling and Stretching at the END of the axon (connected to neuronB)
+        if (distFromEnd < u_swellFalloff) {
+            float influence = pow(1.0 - smoothstep(0.0, u_swellFalloff, distFromEnd), 2.0);
+            currentSwellFactor += u_neuronPulseStateEnd * influence;
+        }
+        
+        currentSwellFactor = clamp(currentSwellFactor, 0.0, 1.0);
+
+        vec3 displacedPosition = position + normal * currentSwellFactor * u_swellIntensity;
+        
+        // Attempt at a "stretch" by moving points near neuron along the view vector (crude approximation of pulling)
+        // This is highly experimental and might not look right.
+        // if (distFromStart < u_swellFalloff) {
+        //    displacedPosition += normalize(cameraPosition - (modelMatrix * vec4(position,1.0)).xyz) * u_neuronPulseStateStart * u_stretchIntensity * (1.0 - distFromStart/u_swellFalloff) ;
+        // }
+        // if (distFromEnd < u_swellFalloff) {
+        //    displacedPosition += normalize(cameraPosition - (modelMatrix * vec4(position,1.0)).xyz) * u_neuronPulseStateEnd * u_stretchIntensity * (1.0 - distFromEnd/u_swellFalloff);
+        // }
+        // Sticking to enhanced radial swell for now.
+
         gl_Position = projectionMatrix * modelViewMatrix * vec4(displacedPosition, 1.0);
     }
 `;
@@ -114,7 +146,7 @@ const axonFragmentShader = `
     uniform sampler2D u_baseTexture;
     uniform vec3 u_baseColorTint;
     uniform float u_baseOpacity;
-    uniform vec3 u_viewDirection_FS; // For Fresnel, if needed
+    // uniform vec3 u_viewDirection_FS; // For Fresnel, if needed (Commented out as not used)
 
     uniform bool u_signalActive;
     uniform float u_signalProgress; // 0.0 to 1.0
@@ -123,19 +155,16 @@ const axonFragmentShader = `
     uniform float u_signalIntensity;
 
     varying vec2 vUv;
-    varying vec3 vNormal_FS; // Renamed from axonVertexShader's vNormal to avoid confusion if it were different
+    // varying vec3 vNormal_FS; // This varying is not being passed from the current axonVertexShader
 
     void main() {
-        vec4 baseTexColor = texture2D(u_baseTexture, vUv);
+        vec4 baseTexColor = texture2D(u_baseTexture, vUv * 2.0); // UV scaling for denser texture maintained
         vec3 finalColor = baseTexColor.rgb * u_baseColorTint;
         float finalAlpha = baseTexColor.a * u_baseOpacity;
 
         // Optional: Subtle Fresnel for base axon material
-        // float baseFresnelTerm = dot(normalize(vNormal_FS), normalize(u_viewDirection_FS)); // Assuming vNormal_FS and u_viewDirection_FS are available and correct
-        // float baseFresnel = pow(1.0 - baseFresnelTerm + 0.01, 2.0); // Very subtle
-        // finalColor += baseFresnel * 0.05; 
-        // finalAlpha = max(finalAlpha, baseFresnel * 0.1);
-        // For now, let's keep it simpler and not add this unless clearly needed for cohesion.
+        // Requires vNormal_FS and view direction. For simplicity, this is omitted for now.
+        // If added, axonVertexShader must pass worldNormal and viewDir.
 
         if (u_signalActive) {
             float halfSignalLength = u_signalLength * 0.5;
@@ -476,6 +505,8 @@ const auraFragmentShader = `
 
     ${glslNoise} // Embed noise function
 
+    /*
+    // Aura Fragment Shader - Commented Out
     void main() {
         precision mediump float; // Added precision
         // Fresnel for gaseous edge
@@ -504,7 +535,11 @@ const auraFragmentShader = `
         
         gl_FragColor = vec4(emissiveColor, finalAlpha);
     }
+    */
 `;
+
+// const auraVertexShader = `...`; // Fully commented out
+// const auraFragmentShader = `...`; // Fully commented out
 
 
 if (THREE.OrbitControls) {
@@ -580,24 +615,25 @@ class Neuron extends THREE.Group {
         this.coreMesh = new THREE.Mesh(coreGeometry, this.coreMaterial);
         this.add(this.coreMesh);
 
-        // Aura: Shimmering and gaseous
+        // Aura: Shimmering and gaseous - REMOVED
+        /*
         const auraGeometry = new THREE.SphereGeometry(coreRadius * auraRadiusMultiplier, 64, 64);
         this.auraMaterial = new THREE.ShaderMaterial({
-            vertexShader: auraVertexShader, // Simple pass-through, provides varyings
+            vertexShader: auraVertexShader, 
             fragmentShader: auraFragmentShader,
             uniforms: THREE.UniformsUtils.merge([
                 this.sharedUniforms,
                 {
                     u_auraColor: { value: this.auraColor },
                     u_auraBaseAlpha: { value: auraOpacity },
-                    u_auraFresnelPower: { value: 3.0 + Math.random() * 1.5 }, // Aura Fresnel
+                    u_auraFresnelPower: { value: 3.0 + Math.random() * 1.5 }, 
                     u_auraFresnelBias: { value: 0.05 + Math.random() * 0.05 },
                     u_noiseFrequencyAura: { value: 1.5 + Math.random() * 0.8 }, 
                     u_noiseSpeedAura: { value: 0.25 + Math.random() * 0.1 },
                     u_noiseImpactAuraAlpha: { value: 0.4 + Math.random() * 0.2 },
                     u_noiseImpactAuraEmissive: { value: 0.5 + Math.random() * 0.3 },
                     u_organicTextureAura: { value: organicTexture2 },
-                    u_textureInfluenceAura: { value: 0.4 + Math.random() * 0.3 } // How much texture affects alpha/emissive
+                    u_textureInfluenceAura: { value: 0.4 + Math.random() * 0.3 } 
                 }
             ]),
             transparent: true,
@@ -605,50 +641,52 @@ class Neuron extends THREE.Group {
             depthWrite: false 
         });
         this.auraMesh = new THREE.Mesh(auraGeometry, this.auraMaterial);
-        this.add(this.auraMesh);
+        // this.add(this.auraMesh); // Aura mesh is no longer added
+        */
 
         this.pulseSpeed = 0.0015 + Math.random() * 0.001;
-        this.createFilaments();
+        // this.createFilaments(); // Call to createFilaments removed
     }
 
-    /**
-     * Creates fine filaments that emanate from the neuron's center.
-     * Filaments are not affected by the new core/aura shaders directly, but will scale with the neuron.
-     * @param {number} numFilaments Number of filaments to generate.
-     * @param {number} minLength Minimum length of a filament.
-     * @param {number} maxLength Maximum length of a filament.
-     * @param {number} filamentRadius Radius of the filament tube.
-     * @param {number} color Color of the filaments.
-     * @param {number} opacity Opacity of the filaments.
-     */
-    createFilaments(numFilaments = 10, minLength = 0.4, maxLength = 1.2, filamentRadius = 0.006, opacity = 0.5) {
-        // Derive filament color from neuron's aura color, but make it fainter/desaturated
-        const baseFilamentColor = this.auraColor.clone().multiplyScalar(0.6).lerp(new THREE.Color(0xffffff), 0.3);
-
-        for (let i = 0; i < numFilaments; i++) {
-            const randomDirection = new THREE.Vector3(
-                Math.random() * 2 - 1, // -1 to 1
-                Math.random() * 2 - 1, // -1 to 1
-                Math.random() * 2 - 1  // -1 to 1
-            ).normalize();
-
-            // Determine a random length for the filament.
-            const length = minLength + Math.random() * (maxLength - minLength);
-            const endPoint = randomDirection.multiplyScalar(length);
-            const startPoint = new THREE.Vector3(0, 0, 0); // Filaments start at the neuron's local origin.
-
-            // Create a tube geometry for the filament.
-            const curve = new THREE.LineCurve3(startPoint, endPoint);
-            const geometry = new THREE.TubeGeometry(curve, 8, filamentRadius, 4, false);
-            const material = new THREE.MeshBasicMaterial({
-                color: baseFilamentColor, // For MeshBasicMaterial, 'color' dictates the emissive appearance
-                transparent: true,
-                opacity: opacity * (0.7 + Math.random() * 0.3) // Add slight opacity variation
-            });
-            const filamentMesh = new THREE.Mesh(geometry, material);
-            this.add(filamentMesh); // Add filament as a child of the Neuron group.
-        }
-    }
+    // /**
+    //  * Creates fine filaments that emanate from the neuron's center.
+    //  * Filaments are not affected by the new core/aura shaders directly, but will scale with the neuron.
+    //  * @param {number} numFilaments Number of filaments to generate.
+    //  * @param {number} minLength Minimum length of a filament.
+    //  * @param {number} maxLength Maximum length of a filament.
+    //  * @param {number} filamentRadius Radius of the filament tube.
+    //  * @param {number} color Color of the filaments.
+    //  * @param {number} opacity Opacity of the filaments.
+    //  */
+    // createFilaments(numFilaments = 10, minLength = 0.4, maxLength = 1.2, filamentRadius = 0.006, opacity = 0.5) {
+    //     // Derive filament color from neuron's core color now, as aura is removed.
+    //     const baseFilamentColor = this.coreColor.clone().multiplyScalar(0.5).lerp(new THREE.Color(0xffffff), 0.4);
+    //
+    //
+    //     for (let i = 0; i < numFilaments; i++) {
+    //         const randomDirection = new THREE.Vector3(
+    //             Math.random() * 2 - 1, // -1 to 1
+    //             Math.random() * 2 - 1, // -1 to 1
+    //             Math.random() * 2 - 1  // -1 to 1
+    //         ).normalize();
+    //
+    //         // Determine a random length for the filament.
+    //         const length = minLength + Math.random() * (maxLength - minLength);
+    //         const endPoint = randomDirection.multiplyScalar(length);
+    //         const startPoint = new THREE.Vector3(0, 0, 0); // Filaments start at the neuron's local origin.
+    //
+    //         // Create a tube geometry for the filament.
+    //         const curve = new THREE.LineCurve3(startPoint, endPoint);
+    //         const geometry = new THREE.TubeGeometry(curve, 8, filamentRadius, 4, false);
+    //         const material = new THREE.MeshBasicMaterial({
+    //             color: baseFilamentColor, // For MeshBasicMaterial, 'color' dictates the emissive appearance
+    //             transparent: true,
+    //             opacity: opacity * (0.7 + Math.random() * 0.3) // Add slight opacity variation
+    //         });
+    //         const filamentMesh = new THREE.Mesh(geometry, material);
+    //         this.add(filamentMesh); // Add filament as a child of the Neuron group.
+    //     }
+    // }
 
     /**
      * Updates the neuron's state, its pulsing animation, and shader uniforms.
@@ -918,9 +956,9 @@ function createAxon(neuronA, neuronB, color = 0x4488FF, radius = 0.025, useCurve
     const axonBaseColor = new THREE.Color(color); // Original color passed to createAxon
     const material = new THREE.ShaderMaterial({
         uniforms: {
-            u_baseTexture: { value: organicTexture2 },
-            u_baseColorTint: { value: axonBaseColor.clone().multiplyScalar(0.75) }, // Tint for organic texture
-            u_baseOpacity: { value: 0.6 }, // Increased base opacity for more presence
+            u_baseTexture: { value: organicTexture2 }, 
+            u_baseColorTint: { value: axonBaseColor.clone().multiplyScalar(0.85) }, 
+            u_baseOpacity: { value: 0.65 }, 
             
             u_signalActive: { value: false },
             u_signalProgress: { value: 0.0 },
@@ -931,9 +969,9 @@ function createAxon(neuronA, neuronB, color = 0x4488FF, radius = 0.025, useCurve
             // New uniforms for swelling effect
             u_neuronPulseStateStart: { value: 0.0 },
             u_neuronPulseStateEnd: { value: 0.0 },
-            u_swellIntensity: { value: 0.15 }, 
-            u_swellFalloff: { value: 0.25 },
-            // u_viewDirection_FS: { value: new THREE.Vector3() } // If Fresnel were added
+            u_swellIntensity: { value: 0.22 }, 
+            u_swellFalloff: { value: 0.20 },    
+            u_stretchIntensity: { value: 0.05 } 
         },
         vertexShader: axonVertexShader, 
         fragmentShader: axonFragmentShader, 
@@ -949,6 +987,20 @@ function createAxon(neuronA, neuronB, color = 0x4488FF, radius = 0.025, useCurve
     axonMesh.isSignalActive = false;
     axonMesh.signalProgress = 0.0;
     axonMesh.signalColor = new THREE.Color(0xffffff); // This will be set by the neuron
+    
+    // Store references to connected neurons and initial curve properties for animation
+    axonMesh.neuronA = neuronA;
+    axonMesh.neuronB = neuronB;
+    // Store the original offset direction and magnitude factor for consistent curve shape
+    // The controlPointOffset vector itself is relative to the midpoint and captures the initial "bend" direction and strength
+    const initialMidPoint = new THREE.Vector3().addVectors(posA, posB).multiplyScalar(0.5);
+    axonMesh.initialControlPointOffset = controlPoint.clone().sub(initialMidPoint); // Store the calculated offset
+    axonMesh.swaySeed = Math.random() * 1000; // For desynchronized swaying
+
+    // Store segments for geometry updates
+    axonMesh.tubularSegments = tubularSegments;
+    axonMesh.radialSegments = radialSegments;
+    axonMesh.baseRadius = baseRadius; // Store baseRadius for getRadiusAt
 
     // Create Particle System for this Axon (remains the same)
     const particlePositions = new Float32Array(MAX_PARTICLES_PER_AXON * 3);
@@ -1106,6 +1158,20 @@ if (neurons.length >= 6) {
 //----------------------------------------------------------------------------------
 const clock = new THREE.Clock(); // Clock for getting deltaTime
 const tempParticlePosition = new THREE.Vector3(); // Pre-allocate for particle updates
+const tempAxonPosA = new THREE.Vector3();
+const tempAxonPosB = new THREE.Vector3();
+const tempMidPoint = new THREE.Vector3();
+const tempDir = new THREE.Vector3();
+const tempPerpendicular = new THREE.Vector3();
+const tempBaseControlPoint = new THREE.Vector3();
+const tempSwayOffset = new THREE.Vector3();
+const tempAnimatedControlPoint = new THREE.Vector3();
+const tempCurvePoint = new THREE.Vector3();
+const tempNormal = new THREE.Vector3();
+const tempBinormal = new THREE.Vector3();
+const tempTangent = new THREE.Vector3();
+const tempBasisMatrix = new THREE.Matrix4();
+
 
 function animate() {
     requestAnimationFrame(animate); // Request the next frame for smooth animation.
@@ -1123,8 +1189,71 @@ function animate() {
         neuron.update(deltaTime); // Pass deltaTime to neuron's update method
     });
 
+    const time = Date.now() * 0.0002; // Slow time factor for swaying
+    const swayAmount = 0.5; // Max sway displacement
+
     // Animate axon signals and particles
     axons.forEach(axon => {
+        // --- Animate Axon Sway (Option A: JS Curve Update) ---
+        if (axon.neuronA && axon.neuronB && axon.initialControlPointOffset) {
+            tempAxonPosA.copy(axon.neuronA.position);
+            tempAxonPosB.copy(axon.neuronB.position);
+            
+            // Recalculate midpoint
+            tempMidPoint.addVectors(tempAxonPosA, tempAxonPosB).multiplyScalar(0.5);
+            
+            // Use the stored initial offset to determine the base control point's position relative to current midpoint
+            // This keeps the curve's fundamental shape consistent even if neurons move slightly
+            tempBaseControlPoint.copy(tempMidPoint).add(axon.initialControlPointOffset);
+
+            // Apply sway
+            tempSwayOffset.x = Math.sin(time + axon.swaySeed) * swayAmount;
+            tempSwayOffset.y = Math.cos(time * 0.7 + axon.swaySeed * 1.2) * swayAmount * 0.5;
+            tempSwayOffset.z = Math.sin(time * 0.5 + axon.swaySeed * 1.5) * swayAmount * 0.7;
+            tempAnimatedControlPoint.copy(tempBaseControlPoint).add(tempSwayOffset);
+
+            // Create new curve for this frame
+            const newCurve = new THREE.QuadraticBezierCurve3(tempAxonPosA, tempAnimatedControlPoint, tempAxonPosB);
+            
+            // Update geometry attributes
+            const positions = axon.geometry.attributes.position;
+            const normals = axon.geometry.attributes.normal;
+            const tubularSegments = axon.tubularSegments; // Retrieve stored value
+            const radialSegments = axon.radialSegments;   // Retrieve stored value
+            const baseRadiusFunc = t => axon.baseRadius * (0.5 + Math.sin(Math.PI * t) * 0.5);
+
+
+            const newPoints = newCurve.getPoints(tubularSegments);
+            const newFrames = newCurve.computeFrenetFrames(tubularSegments, false);
+
+            for (let i = 0; i <= tubularSegments; i++) {
+                tempCurvePoint.copy(newPoints[i]);
+                tempNormal.copy(newFrames.normals[i]);
+                tempBinormal.copy(newFrames.binormals[i]);
+                tempTangent.copy(newFrames.tangents[i]);
+                const currentRadius = baseRadiusFunc(i / tubularSegments);
+                
+                tempBasisMatrix.makeBasis(tempBinormal, tempNormal, tempTangent);
+
+                for (let j = 0; j <= radialSegments; j++) {
+                    const angle = (j / radialSegments) * Math.PI * 2;
+                    const x = currentRadius * Math.cos(angle);
+                    const y = currentRadius * Math.sin(angle);
+
+                    const P = tempParticlePosition.set(x,y,0).applyMatrix4(tempBasisMatrix).add(tempCurvePoint); // Reuse tempParticlePosition for P
+                    const vertexIndex = i * (radialSegments + 1) + j;
+                    positions.setXYZ(vertexIndex, P.x, P.y, P.z);
+
+                    const N = tempSwayOffset.set(x,y,0).normalize().applyMatrix4(tempBasisMatrix); // Reuse tempSwayOffset for N
+                    normals.setXYZ(vertexIndex, N.x, N.y, N.z);
+                }
+            }
+            positions.needsUpdate = true;
+            normals.needsUpdate = true;
+        }
+        // --- End Axon Sway Animation ---
+
+
         // Animate new "light orb" signal
         if (axon.isSignalActive && axon.material.isShaderMaterial) {
             axon.signalProgress += axonSignalSpeed * deltaTime;
