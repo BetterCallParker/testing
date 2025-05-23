@@ -52,9 +52,9 @@ if (THREE.EffectComposer && THREE.RenderPass && THREE.UnrealBloomPass) {
     // Adjusted parameters for a softer, more nuanced bloom with the new detailed shaders.
     const bloomPass = new THREE.UnrealBloomPass(
         new THREE.Vector2(window.innerWidth, window.innerHeight), // resolution
-        0.8, // strength: Reduced for a softer glow.
-        0.7, // radius: Slightly increased for a bit more spill.
-        0.85 // threshold: Increased to target mainly the brightest emissive parts.
+        0.75, // strength: Further subtle reduction for less haze
+        0.7,  // radius: Maintained
+        0.88  // threshold: Slightly increased to ensure only very bright parts bloom strongly
     );
     composer.addPass(bloomPass);
 } else {
@@ -71,11 +71,181 @@ let controls; // OrbitControls for camera manipulation (zoom, pan, rotate).
 // SHADER DEFINITIONS (GLSL)
 //----------------------------------------------------------------------------------
 
+const axonVertexShader = `
+    varying vec2 vUv;
+    // attribute vec3 normal; // Removed: 'normal' is a standard attribute provided by Three.js if geometry has normals.
+
+    uniform float u_neuronPulseStateStart; // 0.0 to 1.0
+    uniform float u_neuronPulseStateEnd;   // 0.0 to 1.0
+    uniform float u_swellIntensity;        // e.g., 0.1 to 0.5
+    uniform float u_swellFalloff;          // e.g., 0.2 (20% of axon length)
+
+    void main() {
+        vUv = uv;
+        
+        float distFromStart = vUv.y;
+        float distFromEnd = 1.0 - vUv.y;
+        float currentSwellFactor = 0.0;
+
+        // Corrected smoothstep logic:
+        // smoothstep(edge0, edge1, x) gives 0 if x < edge0, 1 if x > edge1, and smooth transition between.
+        // We want influence to be 1.0 at the very start/end (dist = 0) and 0.0 at u_swellFalloff.
+        if (distFromStart < u_swellFalloff) {
+            float localInfluence = 1.0 - smoothstep(0.0, u_swellFalloff, distFromStart);
+            currentSwellFactor += u_neuronPulseStateStart * localInfluence;
+        }
+        if (distFromEnd < u_swellFalloff) {
+            float localInfluence = 1.0 - smoothstep(0.0, u_swellFalloff, distFromEnd);
+            currentSwellFactor += u_neuronPulseStateEnd * localInfluence;
+        }
+        currentSwellFactor = clamp(currentSwellFactor, 0.0, 1.0);
+
+        // The 'normal' attribute for our custom tube points radially outwards.
+        // So, displacing along the normal scales the radius.
+        vec3 displacedPosition = position + normal * currentSwellFactor * u_swellIntensity;
+        
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(displacedPosition, 1.0);
+    }
+`;
+
+const axonFragmentShader = `
+    precision mediump float;
+
+    uniform sampler2D u_baseTexture;
+    uniform vec3 u_baseColorTint;
+    uniform float u_baseOpacity;
+    uniform vec3 u_viewDirection_FS; // For Fresnel, if needed
+
+    uniform bool u_signalActive;
+    uniform float u_signalProgress; // 0.0 to 1.0
+    uniform float u_signalLength;   // e.g., 0.15
+    uniform vec3 u_signalColor;
+    uniform float u_signalIntensity;
+
+    varying vec2 vUv;
+    varying vec3 vNormal_FS; // Renamed from axonVertexShader's vNormal to avoid confusion if it were different
+
+    void main() {
+        vec4 baseTexColor = texture2D(u_baseTexture, vUv);
+        vec3 finalColor = baseTexColor.rgb * u_baseColorTint;
+        float finalAlpha = baseTexColor.a * u_baseOpacity;
+
+        // Optional: Subtle Fresnel for base axon material
+        // float baseFresnelTerm = dot(normalize(vNormal_FS), normalize(u_viewDirection_FS)); // Assuming vNormal_FS and u_viewDirection_FS are available and correct
+        // float baseFresnel = pow(1.0 - baseFresnelTerm + 0.01, 2.0); // Very subtle
+        // finalColor += baseFresnel * 0.05; 
+        // finalAlpha = max(finalAlpha, baseFresnel * 0.1);
+        // For now, let's keep it simpler and not add this unless clearly needed for cohesion.
+
+        if (u_signalActive) {
+            float halfSignalLength = u_signalLength * 0.5;
+            // Calculate distance from the center of the signal band.
+            // vUv.y is assumed to run from 0 (start of axon) to 1 (end of axon).
+            float distFromSignalCenter = abs(vUv.y - u_signalProgress);
+
+            if (distFromSignalCenter < halfSignalLength) {
+                // Create a profile for the signal (e.g., smooth falloff)
+                // float signalProfile = 1.0 - smoothstep(0.0, halfSignalLength, distFromSignalCenter); // Linear falloff
+                float signalProfile = smoothstep(halfSignalLength, 0.0, distFromSignalCenter); // Smoother falloff
+
+                // Mix base color with signal color
+                finalColor = mix(finalColor, u_signalColor, signalProfile * u_signalIntensity);
+                finalAlpha = mix(finalAlpha, 1.0, signalProfile * u_signalIntensity); // Signal is more opaque
+            }
+        }
+        gl_FragColor = vec4(finalColor, finalAlpha);
+    }
+`;
+
+
+//----------------------------------------------------------------------------------
+// PROCEDURAL TEXTURE GENERATION (JavaScript)
+//----------------------------------------------------------------------------------
+
+/**
+ * Generates a simple procedural noise texture (Value Noise).
+ * @param {number} size - Width and height of the texture.
+ * @param {number} initialFrequency - Initial frequency for the noise.
+ * @param {number} octaves - Number of noise layers to blend.
+ * @returns {THREE.DataTexture}
+ */
+function createProceduralNoiseTexture(size = 128, initialFrequency = 4.0, octaves = 3) {
+    const data = new Uint8Array(size * size * 4); // RGBA
+
+    // Simple value noise generation
+    const R = Math.random;
+    const M = 0xffffffff;
+    let S = 2147483647 * R() | 0; // Seed
+    const T = () => (S = S * 48271 % M) / M; // LCG for seeded random
+
+    const p = new Array(512);
+    const g = new Array(512);
+    for(let i=0; i<256; ++i) p[i] = p[i+256] = i;
+    for(let i=255; i>=0; --i) { const j = (T()*i)|0; const t = p[i]; p[i]=p[j]; p[j]=t; } // Shuffle p
+    for(let i=0; i<256; ++i) g[i] = g[i+256] = T() * 2 - 1; // Random gradients/values between -1 and 1
+
+    const fade = t => t*t*t*(t*(t*6-15)+10);
+    const lerp = (a,b,t) => a + t*(b-a);
+
+    function valueNoise(x, y) {
+        const X = Math.floor(x) & 255;
+        const Y = Math.floor(y) & 255;
+        const xf = x - Math.floor(x);
+        const yf = y - Math.floor(y);
+
+        const tl = g[p[X] + Y];
+        const tr = g[p[X+1] + Y];
+        const bl = g[p[X] + Y+1];
+        const br = g[p[X+1] + Y+1];
+
+        const u = fade(xf);
+        const v = fade(yf);
+
+        return lerp(lerp(tl, tr, u), lerp(bl, br, u), v);
+    }
+
+    for (let y = 0; y < size; y++) {
+        for (let x = 0; x < size; x++) {
+            let total = 0;
+            let frequency = initialFrequency;
+            let amplitude = 1.0;
+            let maxValue = 0; // For normalizing
+
+            for (let i = 0; i < octaves; i++) {
+                total += valueNoise(x * frequency / size, y * frequency / size) * amplitude;
+                maxValue += amplitude;
+                amplitude *= 0.5; // Lacunarity
+                frequency *= 2.0; // Persistence
+            }
+            
+            let normalizedValue = (total / maxValue) * 0.5 + 0.5; // Normalize to 0-1 range
+            normalizedValue = Math.max(0, Math.min(1, normalizedValue)); // Clamp
+            const intensity = Math.floor(normalizedValue * 255);
+
+            const stride = (y * size + x) * 4;
+            data[stride] = intensity;     // R
+            data[stride + 1] = intensity; // G
+            data[stride + 2] = intensity; // B
+            data[stride + 3] = 255;       // A (fully opaque)
+        }
+    }
+
+    const texture = new THREE.DataTexture(data, size, size, THREE.RGBAFormat, THREE.UnsignedByteType);
+    texture.wrapS = THREE.RepeatWrapping;
+    texture.wrapT = THREE.RepeatWrapping;
+    texture.needsUpdate = true;
+    return texture;
+}
+
+const organicTexture1 = createProceduralNoiseTexture(256, 4.0, 4); // For core
+const organicTexture2 = createProceduralNoiseTexture(128, 8.0, 3); // For aura & axons (more fine-grained)
+
+
 // Noise function will be used by both core and aura shaders
 const glslNoise = `
-    precision mediump float; // Added precision
     // Classic Perlin 3D Noise (by Stefan Gustavson)
     // https://github.com/stegu/webgl-noise/blob/master/src/noise3D.glsl
+    // Precision is now set in individual shaders that use this.
     vec3 mod289(vec3 x) {
         return x - floor(x * (1.0 / 289.0)) * 289.0;
     }
@@ -178,7 +348,7 @@ const particleFragmentShader = `
     varying float vAlpha;
 
     void main() {
-        precision mediump float; // Added precision
+        // precision mediump float; // Already set in previous turn, but ensuring it's here.
         float dist = length(gl_PointCoord - vec2(0.5));
         if (dist > 0.45) discard; // Create a slightly smaller circle than 0.5 to avoid hard edges
 
@@ -188,6 +358,8 @@ const particleFragmentShader = `
 
 
 const neuronVertexShader = `
+    precision highp float; // Required for vertex shaders if not default
+
     uniform float u_time;
     uniform float u_frequency;
     uniform float u_amplitude;
@@ -222,9 +394,11 @@ const neuronFragmentShader = `
     uniform float u_time;
     uniform float u_fresnelPower; // Power for Fresnel effect
     uniform float u_fresnelBias;
-    uniform float u_noiseFrequencyCore;
+    uniform float u_noiseFrequencyCore; // For 3D noise displacement/energy
     uniform float u_noiseSpeedCore;
     uniform float u_noiseImpactCore;
+    uniform sampler2D u_organicTextureCore; // New organic texture
+    uniform float u_textureInfluenceCore;   // How much texture affects base color/noise
 
     varying vec3 vNormal;
     varying vec2 vUv;
@@ -245,9 +419,13 @@ const neuronFragmentShader = `
         float energyNoise = snoise(vWorldPosition * u_noiseFrequencyCore + u_time * u_noiseSpeedCore);
         energyNoise = (energyNoise * 0.5 + 0.5); // Map from -1..1 to 0..1
 
-        // Base color modulated by noise and Fresnel
-        vec3 baseColor = u_coreColor;
-        vec3 finalColor = baseColor + baseColor * energyNoise * u_noiseImpactCore; // Noise adds to brightness
+        // Sample organic texture
+        float organicPattern = texture2D(u_organicTextureCore, vUv * 2.0).r; // Scale UVs for more tiling
+        
+        // Base color modulated by noise, texture, and Fresnel
+        vec3 baseColor = u_coreColor * (1.0 - u_textureInfluenceCore + organicPattern * u_textureInfluenceCore * 2.0); // Modulate base color by texture
+        
+        vec3 finalColor = baseColor + baseColor * energyNoise * u_noiseImpactCore * (0.5 + organicPattern * 0.5); // Noise adds to brightness, modulated by texture
         finalColor += fresnel * baseColor * 2.0; // Fresnel significantly brightens edges
 
         // Make the very center a bit brighter based on UVs (assuming UVs are somewhat spherical)
@@ -283,10 +461,12 @@ const auraFragmentShader = `
     uniform float u_auraBaseAlpha;
     uniform float u_auraFresnelPower;
     uniform float u_auraFresnelBias;
-    uniform float u_noiseFrequencyAura;
+    uniform float u_noiseFrequencyAura; // For 3D noise shimmer
     uniform float u_noiseSpeedAura;
     uniform float u_noiseImpactAuraAlpha;
     uniform float u_noiseImpactAuraEmissive;
+    uniform sampler2D u_organicTextureAura; // New organic texture
+    uniform float u_textureInfluenceAura;   // How much texture affects alpha/emissive
 
 
     varying vec3 vNormal;
@@ -308,14 +488,19 @@ const auraFragmentShader = `
         float shimmerNoise = snoise(vWorldPosition * u_noiseFrequencyAura + u_time * u_noiseSpeedAura);
         shimmerNoise = (shimmerNoise * 0.5 + 0.5); // Map to 0..1
 
+        // Sample organic texture
+        float organicPattern = texture2D(u_organicTextureAura, vUv * 3.0).r; // Scale UVs for more tiling
+
         // Modulate alpha
-        float finalAlpha = u_auraBaseAlpha * (1.0 - u_noiseImpactAuraAlpha * (1.0 - shimmerNoise)); // Noise reduces alpha slightly to create shimmer
-        finalAlpha += fresnel * 0.2; // Fresnel adds a bit to edge opacity
+        float baseAlphaModulated = u_auraBaseAlpha * (1.0 - u_textureInfluenceAura * (1.0 - organicPattern)); // Texture makes parts denser/more opaque
+        float finalAlpha = baseAlphaModulated * (1.0 - u_noiseImpactAuraAlpha * (1.0 - shimmerNoise));
+        finalAlpha += fresnel * 0.2;
         finalAlpha = clamp(finalAlpha, 0.0, 1.0);
         
         // Modulate emissive intensity
-        vec3 emissiveColor = u_auraColor * (0.5 + shimmerNoise * u_noiseImpactAuraEmissive); // Noise boosts emissive
-        emissiveColor += fresnel * u_auraColor * 0.5; // Fresnel adds to edge emissiveness
+        vec3 emissiveColor = u_auraColor * (0.5 + shimmerNoise * u_noiseImpactAuraEmissive);
+        emissiveColor *= (1.0 - u_textureInfluenceAura * 0.5 + organicPattern * u_textureInfluenceAura * 0.5); // Texture subtly modulates emissive brightness
+        emissiveColor += fresnel * u_auraColor * 0.5;
         
         gl_FragColor = vec4(emissiveColor, finalAlpha);
     }
@@ -355,6 +540,16 @@ class Neuron extends THREE.Group {
     constructor(coreRadius = 0.2, auraRadiusMultiplier = 2, coreColor = 0xFFFFAA, auraColor = 0x00AAFF, auraOpacity = 0.3) {
         super();
 
+        this.coreColor = new THREE.Color(coreColor); // Store for easy access
+        this.auraColor = new THREE.Color(auraColor); // Store for easy access
+
+        this.outgoingAxons = [];
+        this.incomingAxons = []; // For receiving pulse state for swelling
+        this.signalCooldown = 0.0;
+        this.canFireSignal = true;
+        this.peakPulseThreshold = 0.90; 
+        this.lastPulseValue = 0.0;      
+
         // Shared time uniform for both core and aura shaders
         this.sharedUniforms = {
             u_time: { value: 0.0 }
@@ -368,14 +563,16 @@ class Neuron extends THREE.Group {
             uniforms: THREE.UniformsUtils.merge([
                 this.sharedUniforms,
                 {
-                    u_coreColor: { value: new THREE.Color(coreColor) },
+                    u_coreColor: { value: this.coreColor },
                     u_frequency: { value: 3.0 + Math.random() * 2.0 }, // For displacement
                     u_amplitude: { value: 0.08 + Math.random() * 0.07 }, // For displacement
-                    u_fresnelPower: { value: 2.5 + Math.random() * 1.0 },
+                    u_fresnelPower: { value: 2.5 + Math.random() * 1.0 }, // Core Fresnel
                     u_fresnelBias: { value: 0.1 + Math.random() * 0.1 },
-                    u_noiseFrequencyCore: { value: 2.0 + Math.random() * 1.0 },
+                    u_noiseFrequencyCore: { value: 2.0 + Math.random() * 1.0 }, // For 3D noise
                     u_noiseSpeedCore: { value: 0.15 + Math.random() * 0.1 },
-                    u_noiseImpactCore: { value: 0.3 + Math.random() * 0.2 }
+                    u_noiseImpactCore: { value: 0.3 + Math.random() * 0.2 },
+                    u_organicTextureCore: { value: organicTexture1 },
+                    u_textureInfluenceCore: { value: 0.3 + Math.random() * 0.2 } // How much texture affects base color
                 }
             ]),
             transparent: false // Core is generally opaque
@@ -391,19 +588,21 @@ class Neuron extends THREE.Group {
             uniforms: THREE.UniformsUtils.merge([
                 this.sharedUniforms,
                 {
-                    u_auraColor: { value: new THREE.Color(auraColor) },
+                    u_auraColor: { value: this.auraColor },
                     u_auraBaseAlpha: { value: auraOpacity },
-                    u_auraFresnelPower: { value: 3.0 + Math.random() * 1.5 },
+                    u_auraFresnelPower: { value: 3.0 + Math.random() * 1.5 }, // Aura Fresnel
                     u_auraFresnelBias: { value: 0.05 + Math.random() * 0.05 },
-                    u_noiseFrequencyAura: { value: 1.5 + Math.random() * 0.8 },
+                    u_noiseFrequencyAura: { value: 1.5 + Math.random() * 0.8 }, 
                     u_noiseSpeedAura: { value: 0.25 + Math.random() * 0.1 },
                     u_noiseImpactAuraAlpha: { value: 0.4 + Math.random() * 0.2 },
-                    u_noiseImpactAuraEmissive: { value: 0.5 + Math.random() * 0.3 }
+                    u_noiseImpactAuraEmissive: { value: 0.5 + Math.random() * 0.3 },
+                    u_organicTextureAura: { value: organicTexture2 },
+                    u_textureInfluenceAura: { value: 0.4 + Math.random() * 0.3 } // How much texture affects alpha/emissive
                 }
             ]),
             transparent: true,
-            blending: THREE.AdditiveBlending, // Good for glowing gas
-            depthWrite: false // Often good for transparent additive effects
+            blending: THREE.AdditiveBlending, 
+            depthWrite: false 
         });
         this.auraMesh = new THREE.Mesh(auraGeometry, this.auraMaterial);
         this.add(this.auraMesh);
@@ -422,9 +621,11 @@ class Neuron extends THREE.Group {
      * @param {number} color Color of the filaments.
      * @param {number} opacity Opacity of the filaments.
      */
-    createFilaments(numFilaments = 10, minLength = 0.4, maxLength = 1.2, filamentRadius = 0.006, color = 0x00BBFF, opacity = 0.6) {
+    createFilaments(numFilaments = 10, minLength = 0.4, maxLength = 1.2, filamentRadius = 0.006, opacity = 0.5) {
+        // Derive filament color from neuron's aura color, but make it fainter/desaturated
+        const baseFilamentColor = this.auraColor.clone().multiplyScalar(0.6).lerp(new THREE.Color(0xffffff), 0.3);
+
         for (let i = 0; i < numFilaments; i++) {
-            // Generate a random direction vector.
             const randomDirection = new THREE.Vector3(
                 Math.random() * 2 - 1, // -1 to 1
                 Math.random() * 2 - 1, // -1 to 1
@@ -438,12 +639,11 @@ class Neuron extends THREE.Group {
 
             // Create a tube geometry for the filament.
             const curve = new THREE.LineCurve3(startPoint, endPoint);
-            const geometry = new THREE.TubeGeometry(curve, 8, filamentRadius, 4, false); // (path, tubularSegments, radius, radialSegments, closed)
+            const geometry = new THREE.TubeGeometry(curve, 8, filamentRadius, 4, false);
             const material = new THREE.MeshBasicMaterial({
-                color: color,
-                emissive: color, // Emissive for bloom.
+                color: baseFilamentColor, // For MeshBasicMaterial, 'color' dictates the emissive appearance
                 transparent: true,
-                opacity: opacity
+                opacity: opacity * (0.7 + Math.random() * 0.3) // Add slight opacity variation
             });
             const filamentMesh = new THREE.Mesh(geometry, material);
             this.add(filamentMesh); // Add filament as a child of the Neuron group.
@@ -457,12 +657,56 @@ class Neuron extends THREE.Group {
      */
     update(deltaTime) {
         // Update shared time uniform for both core and aura shaders
-        this.sharedUniforms.u_time.value += deltaTime * 0.8; // Consolidated time update, speed can be adjusted
+        this.sharedUniforms.u_time.value += deltaTime * 0.8; 
 
         // Overall pulsing scale for the entire Neuron group
-        const pulse = Math.sin(Date.now() * this.pulseSpeed);
-        const scaleFactor = 1 + pulse * 0.08; // 0.08 determines the intensity of the size pulse.
+        const currentPulseValue = Math.sin(Date.now() * this.pulseSpeed); // Ranges -1 to 1
+        const scaleFactor = 1 + currentPulseValue * 0.08; 
         this.scale.set(scaleFactor, scaleFactor, scaleFactor);
+
+        const normalizedPulseIntensity = (currentPulseValue + 1.0) * 0.5; // Map to 0-1 for shader uniform
+
+        // Update outgoing axons for swelling at their start
+        this.outgoingAxons.forEach(axon => {
+            if (axon && axon.material.isShaderMaterial && axon.material.uniforms.u_neuronPulseStateStart) {
+                axon.material.uniforms.u_neuronPulseStateStart.value = normalizedPulseIntensity;
+            }
+        });
+
+        // Update incoming axons for swelling at their end
+        this.incomingAxons.forEach(axon => {
+            if (axon && axon.material.isShaderMaterial && axon.material.uniforms.u_neuronPulseStateEnd) {
+                axon.material.uniforms.u_neuronPulseStateEnd.value = normalizedPulseIntensity;
+            }
+        });
+
+        // Signal Firing Logic (remains the same)
+        if (this.canFireSignal && this.lastPulseValue < this.peakPulseThreshold && currentPulseValue >= this.peakPulseThreshold) {
+            this.outgoingAxons.forEach(axon => {
+                if (axon && !axon.isSignalActive) { 
+                    axon.isSignalActive = true;
+                    axon.signalProgress = 0.0;
+                    const coreColor = this.coreMaterial.uniforms.u_coreColor.value;
+                    axon.signalColor.copy(coreColor).multiplyScalar(1.8); 
+                    
+                    if (axon.material.isShaderMaterial) {
+                        axon.material.uniforms.u_signalActive.value = true;
+                        axon.material.uniforms.u_signalProgress.value = 0.0;
+                        axon.material.uniforms.u_signalColor.value.copy(axon.signalColor);
+                    }
+                }
+            });
+            this.canFireSignal = false;
+            this.signalCooldown = 1.5 + Math.random() * 1.0; 
+        }
+        
+        if (!this.canFireSignal) {
+            this.signalCooldown -= deltaTime;
+            if (this.signalCooldown <= 0) {
+                this.canFireSignal = true;
+            }
+        }
+        this.lastPulseValue = currentPulseValue;
     }
 }
 
@@ -511,10 +755,10 @@ neuronPositions.forEach((pos, index) => {
 //----------------------------------------------------------------------------------
 
 // Particle System Configuration
-const MAX_PARTICLES_PER_AXON = 30; // Reduced from 70 for performance
-const PARTICLE_COLOR = new THREE.Color(0x00ffff); // Cyan particles
-const PARTICLE_BASE_SIZE = 0.05; // Slightly reduced base size
-const PARTICLE_SPEED = 0.12; // Slightly increased speed for visual compensation
+const MAX_PARTICLES_PER_AXON = 30; 
+// PARTICLE_COLOR is now set dynamically in createAxon based on signal color
+const PARTICLE_BASE_SIZE = 0.05; 
+const PARTICLE_SPEED = 0.16; // Increased slightly for better visual flow with signal orbs
 
 
 /**
@@ -557,8 +801,9 @@ function createSignalTexture() {
 }
 
 // Lazily create the texture once and reuse it for all axons
-const globalSignalTexture = createSignalTexture();
-const signalSpeed = -0.8; // Negative to scroll "down" the V axis if UVs are 0 at start, 1 at end
+// const globalSignalTexture = createSignalTexture(); // Keep for reference, but will be replaced by shader logic
+const axonSignalSpeed = 0.7; // Speed of the orb along the axon (0 to 1 per second)
+
 
 /**
  * Creates an axon (a tube connecting two neurons).
@@ -669,31 +914,43 @@ function createAxon(neuronA, neuronB, color = 0x4488FF, radius = 0.025, useCurve
     geometry.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
     geometry.setIndex(indices);
 
-    // Material (still MeshBasicMaterial for now, focusing on geometry)
-    const material = new THREE.MeshBasicMaterial({
-        color: new THREE.Color(color).multiplyScalar(0.3), // Darker base color for the axon itself
+    // Material for axons - Now uses ShaderMaterial for the light orb effect
+    const axonBaseColor = new THREE.Color(color); // Original color passed to createAxon
+    const material = new THREE.ShaderMaterial({
+        uniforms: {
+            u_baseTexture: { value: organicTexture2 },
+            u_baseColorTint: { value: axonBaseColor.clone().multiplyScalar(0.75) }, // Tint for organic texture
+            u_baseOpacity: { value: 0.6 }, // Increased base opacity for more presence
+            
+            u_signalActive: { value: false },
+            u_signalProgress: { value: 0.0 },
+            u_signalLength: { value: 0.18 + Math.random() * 0.1 }, 
+            u_signalColor: { value: new THREE.Color(0xffffff) }, 
+            u_signalIntensity: { value: 1.5 + Math.random() * 0.5 },
+
+            // New uniforms for swelling effect
+            u_neuronPulseStateStart: { value: 0.0 },
+            u_neuronPulseStateEnd: { value: 0.0 },
+            u_swellIntensity: { value: 0.15 }, 
+            u_swellFalloff: { value: 0.25 },
+            // u_viewDirection_FS: { value: new THREE.Vector3() } // If Fresnel were added
+        },
+        vertexShader: axonVertexShader, 
+        fragmentShader: axonFragmentShader, 
         transparent: true,
-        // opacity: 0.5, // Base opacity of the axon tube
-        blending: THREE.AdditiveBlending, // Signals add light
-        emissiveMap: globalSignalTexture,
-        // emissive: 0xffffff, // Full white to let texture control color and intensity
-        // emissiveIntensity: 1.0 // Modulate signal brightness if needed
+        blending: THREE.AdditiveBlending, 
+        depthWrite: false 
     });
-    
-    // Ensure texture is cloned for each material if offsets are unique per axon (which they are)
-    // However, if all signals pulse identically, one material with one texture is fine.
-    // For independent animation (which is what we want via offset), each axon needs its own material instance
-    // or at least its own texture instance if other material props are shared.
-    // The simplest is to clone the material for safety, ensuring emissiveMap instance is unique.
-    // This is not strictly necessary if we are only changing texture.offset, as that's per-texture.
-    // Let's assume for now that manipulating globalSignalTexture.offset directly in the animate loop
-    // for each axon's material will work because the offset is a property of the texture instance used by the material.
-    // If not, we would do: material.emissiveMap = globalSignalTexture.clone(); material.emissiveMap.needsUpdate = true;
 
     const axonMesh = new THREE.Mesh(geometry, material);
     scene.add(axonMesh);
 
-    // Create Particle System for this Axon
+    // Initialize axon-specific signal properties (attached to the mesh object)
+    axonMesh.isSignalActive = false;
+    axonMesh.signalProgress = 0.0;
+    axonMesh.signalColor = new THREE.Color(0xffffff); // This will be set by the neuron
+
+    // Create Particle System for this Axon (remains the same)
     const particlePositions = new Float32Array(MAX_PARTICLES_PER_AXON * 3);
     const particleAlphas = new Float32Array(MAX_PARTICLES_PER_AXON);
     const particleSizes = new Float32Array(MAX_PARTICLES_PER_AXON);
@@ -715,9 +972,13 @@ function createAxon(neuronA, neuronB, color = 0x4488FF, radius = 0.025, useCurve
     particleGeometry.setAttribute('customAlpha', new THREE.BufferAttribute(particleAlphas, 1));
     particleGeometry.setAttribute('customSize', new THREE.BufferAttribute(particleSizes, 1));
 
+    // Particle color will be derived from the axon's signal color (which comes from neuron core)
+    // Make it related but less intense than the main signal orb.
+    const particleColorForThisAxon = axonMesh.signalColor.clone().multiplyScalar(0.6).lerp(new THREE.Color(0xffffff), 0.2); 
+
     const particleMaterial = new THREE.ShaderMaterial({
         uniforms: {
-            u_particleColor: { value: PARTICLE_COLOR },
+            u_particleColor: { value: particleColorForThisAxon }, // Use the derived color
         },
         vertexShader: particleVertexShader,
         fragmentShader: particleFragmentShader,
@@ -793,7 +1054,7 @@ function createStarDust(count = 6000, color = 0xbbccff) { // Slightly reduced st
         uniform vec3 u_starColor;
         varying float vAlpha;
         void main() {
-            precision mediump float; // Added precision
+        // precision mediump float; // Already set in previous turn, but ensuring it's here.
             float dist = length(gl_PointCoord - vec2(0.5));
             if (dist > 0.5) discard;
             gl_FragColor = vec4(u_starColor, vAlpha * (1.0 - dist * 2.0)); // Soft edges
@@ -818,17 +1079,26 @@ function createStarDust(count = 6000, color = 0xbbccff) { // Slightly reduced st
 
 createStarDust(); // Add star dust to the scene
 
-// Define connections between neurons.
-if (neurons.length >= 6) { // Ensure enough neurons exist for these connections.
-    axons.push(createAxon(neurons[0], neurons[1]));
-    axons.push(createAxon(neurons[0], neurons[2]));
-    axons.push(createAxon(neurons[1], neurons[3]));
-    axons.push(createAxon(neurons[2], neurons[4]));
-    axons.push(createAxon(neurons[3], neurons[5]));
-    axons.push(createAxon(neurons[4], neurons[5]));
-    // Example of creating axons with slightly different properties:
-    axons.push(createAxon(neurons[1], neurons[4], 0x66AAFF, 0.02, true));
-    axons.push(createAxon(neurons[0], neurons[5], 0x5599FF, 0.022, true));
+// Define connections between neurons and populate outgoingAxons arrays.
+if (neurons.length >= 6) { 
+    const connections = [
+        [0, 1], [0, 2], [1, 3], [2, 4], [3, 5], [4, 5],
+        [1, 4, 0x66AAFF, 0.02], [0, 5, 0x5599FF, 0.022] // Examples with custom color/radius
+    ];
+
+    connections.forEach(conn => {
+        const n1 = neurons[conn[0]];
+        const n2 = neurons[conn[1]];
+        const axonColor = conn[2] ? conn[2] : undefined; // Use default if not specified
+        const axonRadius = conn[3] ? conn[3] : undefined;
+        
+        if (n1 && n2) {
+            const axon = createAxon(n1, n2, axonColor, axonRadius, true);
+            axons.push(axon);
+            n1.outgoingAxons.push(axon); 
+            n2.incomingAxons.push(axon); // Populate incoming axons for neuron n2
+        }
+    });
 }
 
 //----------------------------------------------------------------------------------
@@ -842,9 +1112,10 @@ function animate() {
 
     const deltaTime = clock.getDelta(); // Get time elapsed since last frame
 
-    // Update OrbitControls if enabled (e.g., for damping or auto-rotation).
-    if (controls && controls.autoRotate) {
-        controls.update(); // Required if controls.enableDamping or controls.autoRotate is true
+    // Update OrbitControls if enabled.
+    // controls.update() is required if controls.enableDamping or controls.autoRotate is set to true.
+    if (controls) {
+        controls.update();
     }
 
     // Update each neuron (handles their pulsing animation and shader updates).
@@ -854,12 +1125,26 @@ function animate() {
 
     // Animate axon signals and particles
     axons.forEach(axon => {
-        // Animate texture-based signal
-        if (axon.material.emissiveMap && axon.material.emissiveMap.isTexture) {
-            axon.material.emissiveMap.offset.y += signalSpeed * deltaTime;
-        }
+        // Animate new "light orb" signal
+        if (axon.isSignalActive && axon.material.isShaderMaterial) {
+            axon.signalProgress += axonSignalSpeed * deltaTime;
+            axon.material.uniforms.u_signalProgress.value = axon.signalProgress;
 
-        // Animate particle system
+            if (axon.signalProgress >= 1.0) {
+                axon.isSignalActive = false;
+                axon.signalProgress = 0.0;
+                axon.material.uniforms.u_signalActive.value = false;
+            }
+        } else if (axon.material.isShaderMaterial && axon.material.uniforms.u_signalActive.value) {
+            // Ensure shader uniform is false if signal is not active on JS side
+            axon.material.uniforms.u_signalActive.value = false;
+        }
+        
+        // The old texture-based signal (emissiveMap scroll) is no longer used for the main signal.
+        // If you want to keep it as a subtle background effect on axons, it could be reinstated here,
+        // but the primary signal is now the shader-driven orb.
+
+        // Animate particle system (remains the same)
         if (axon.particleSystem) {
             const ps = axon.particleSystem;
             const positionsAttribute = ps.pointsMesh.geometry.getAttribute('position');
