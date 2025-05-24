@@ -1277,10 +1277,8 @@ let tfOutputBuffer;
 let neuronDisplacedVertexData = []; // Array to store Float32Array for each neuron
 
 // Shader sources (kept here for clarity for now, could be externalized)
-const tfNeuronVertexShaderSource = `
-    #version 300 es
+const tfNeuronVertexShaderSource = `#version 300 es
     precision highp float;
-
     uniform float u_time;
     uniform float u_frequency;
     uniform float u_amplitude;
@@ -1358,16 +1356,28 @@ const tfNeuronVertexShaderSource = `
     }
 `;
 
-const tfFragmentShaderMinimalSource = `
-    #version 300 es
+const tfFragmentShaderMinimalSource = `#version 300 es
     precision mediump float;
+    out vec4 fragColor;
     void main() {
+        fragColor = vec4(0.0, 0.0, 0.0, 0.0);
         // Outputting transparent black, not strictly necessary with RASTERIZER_DISCARD
         // outColor is implicitly declared for WebGL2 fragment shaders if no other 'out' is present
         // For clarity, explicitly: out vec4 outColor; outColor = vec4(0.0,0.0,0.0,0.0);
     }
 `;
-
+// Helper function to create and compile a shader
+function compileShader(source, type) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+        console.error('Shader compile error for type ' + (type === gl.VERTEX_SHADER ? "VERTEX" : "FRAGMENT") + ':', gl.getShaderInfoLog(shader));
+        gl.deleteShader(shader);
+        return null;
+    }
+    return shader;
+}
 function initTransformFeedback() {
     console.log("Initializing Transform Feedback...");
     gl = renderer.getContext();
@@ -1444,16 +1454,14 @@ function initTransformFeedback() {
 
 function updateAllNeuronTFData() {
     if (!tfProgram || !gl) {
-        // console.warn("TF Program not initialized or WebGL context lost. Skipping TF update.");
         return;
     }
 
-    // Ensure matrixWorld is up-to-date for all neurons before TF pass
-    scene.updateMatrixWorld(true); // Force update of world matrices for all objects in scene
+    scene.updateMatrixWorld(true);
 
     gl.useProgram(tfProgram);
     gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, transformFeedbackObject);
-    gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, tfOutputBuffer); // Bind output buffer for each TF pass
+    gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, tfOutputBuffer);
 
     gl.enable(gl.RASTERIZER_DISCARD);
 
@@ -1468,10 +1476,6 @@ function updateAllNeuronTFData() {
         const normalAttribute = geometry.attributes.normal;
         const vertexCount = positionAttribute.count;
 
-        // These buffers are created and filled for each neuron.
-        // For performance, if geometry is shared or attributes are from a single large buffer,
-        // this could be optimized by using offsets with bindBuffer and vertexAttribPointer.
-        // Given each neuron has its own geometry instance, this is necessary.
         const glPositionBuffer = gl.createBuffer();
         gl.bindBuffer(gl.ARRAY_BUFFER, glPositionBuffer);
         gl.bufferData(gl.ARRAY_BUFFER, positionAttribute.array, gl.STATIC_DRAW);
@@ -1484,47 +1488,54 @@ function updateAllNeuronTFData() {
         gl.enableVertexAttribArray(tf_normalAttributeLocation);
         gl.vertexAttribPointer(tf_normalAttributeLocation, 3, gl.FLOAT, false, 0, 0);
 
-        // Set uniforms
         const coreUniforms = neuron.coreMaterial.uniforms;
-        gl.uniform1f(tf_uTimeLocation, coreUniforms.u_time.value); // Using neuron's own time
+        gl.uniform1f(tf_uTimeLocation, coreUniforms.u_time.value);
         gl.uniform1f(tf_uFrequencyLocation, coreUniforms.u_frequency.value);
         gl.uniform1f(tf_uAmplitudeLocation, coreUniforms.u_amplitude.value);
         gl.uniformMatrix4fv(tf_modelMatrixLocation, false, neuron.coreMesh.matrixWorld.elements);
         
-        // Execute TF
         gl.beginTransformFeedback(gl.POINTS);
         gl.drawArrays(gl.POINTS, 0, vertexCount);
         gl.endTransformFeedback();
 
-        // Read back data for this neuron
         if (!neuronDisplacedVertexData[index] || neuronDisplacedVertexData[index].length !== vertexCount * 3) {
             neuronDisplacedVertexData[index] = new Float32Array(vertexCount * 3);
         }
-        // Output buffer (tfOutputBuffer) is already bound to TRANSFORM_FEEDBACK_BUFFER.
-        // For getBufferSubData, it's good practice to bind to COPY_READ_BUFFER if available,
-        // but it will also work with the generic ARRAY_BUFFER target if it's already bound there.
-        // However, tfOutputBuffer was last bound to ARRAY_BUFFER for gl.bufferData, then to TRANSFORM_FEEDBACK_BUFFER.
-        // To be safe and explicit for getBufferSubData:
-        gl.bindBuffer(gl.COPY_READ_BUFFER, tfOutputBuffer);
-        gl.getBufferSubData(gl.COPY_READ_BUFFER, 0, neuronDisplacedVertexData[index]);
-        gl.bindBuffer(gl.COPY_READ_BUFFER, null); // Unbind from copy read target
 
-        // Cleanup neuron-specific buffers
         gl.deleteBuffer(glPositionBuffer);
         gl.deleteBuffer(glNormalBuffer);
         gl.disableVertexAttribArray(tf_positionAttributeLocation);
         gl.disableVertexAttribArray(tf_normalAttributeLocation);
-
-        // Optional: Log first few values for the first neuron each frame for debugging
-        // if (index === 0) {
-        //     console.log(`TF Data for Neuron 0 (frame ${renderer.info.render.frame}):`, neuronDisplacedVertexData[0].slice(0, 9));
-        // }
     });
 
     gl.disable(gl.RASTERIZER_DISCARD);
     gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, null);
     gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, null);
-    gl.useProgram(null); // Clean up GL state
+    
+    // Create fence and wait with a reasonable timeout
+    const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    gl.flush();
+    
+    // Wait up to 10ms for the GPU to complete (this will actually wait)
+    const waitResult = gl.clientWaitSync(sync, gl.SYNC_FLUSH_COMMANDS_BIT, 10000000); // 10ms in nanoseconds
+    
+    if (waitResult === gl.TIMEOUT_EXPIRED) {
+        console.warn("Transform Feedback sync timeout - continuing anyway");
+    } else if (waitResult === gl.WAIT_FAILED) {
+        console.warn("Transform Feedback sync wait failed");
+    }
+    
+    // Now read the data
+    neurons.forEach((neuron, index) => {
+        if (neuronDisplacedVertexData[index]) {
+            gl.bindBuffer(gl.COPY_READ_BUFFER, tfOutputBuffer);
+            gl.getBufferSubData(gl.COPY_READ_BUFFER, 0, neuronDisplacedVertexData[index]);
+            gl.bindBuffer(gl.COPY_READ_BUFFER, null);
+        }
+    });
+    
+    gl.deleteSync(sync);
+    gl.useProgram(null);
 }
 
 
