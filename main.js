@@ -29,6 +29,7 @@ camera.lookAt(0, 0, 0); // Camera looks at the center of the scene.
 
 // Renderer: Renders the scene using WebGL.
 const renderer = new THREE.WebGLRenderer();
+console.log("Renderer Capabilities WebGL2:", renderer.capabilities.isWebGL2); // Check WebGL2 status
 renderer.setSize(window.innerWidth, window.innerHeight); // Set to full window size.
 document.body.appendChild(renderer.domElement); // Add the renderer's canvas to the HTML body.
 
@@ -80,6 +81,10 @@ const axonVertexShader = `
     uniform float u_swellIntensity;        // Max factor for radial swell
     uniform float u_swellFalloff;          // How far the swell extends along the axon (0 to 1)
     uniform float u_stretchIntensity;      // Max factor for longitudinal stretch (currently unused but planned)
+    uniform float u_startTension;          // Tension at the start of the axon
+    uniform float u_endTension;            // Tension at the end of the axon
+    uniform float u_tensionEffectScale;    // To control impact of tension
+    uniform float u_pulseInfluenceScale;   // To control impact of original pulse
 
     void main() {
         vUv = uv;
@@ -93,16 +98,16 @@ const axonVertexShader = `
         if (distFromStart < u_swellFalloff) {
             // Sharper falloff for a more "pulled" look at the immediate connection point
             float influence = pow(1.0 - smoothstep(0.0, u_swellFalloff, distFromStart), 2.0); 
-            currentSwellFactor += u_neuronPulseStateStart * influence;
+            currentSwellFactor += (u_neuronPulseStateStart * u_pulseInfluenceScale + u_startTension * u_tensionEffectScale) * influence;
         }
 
         // Enhanced Swelling/Stretching at the END of the axon (connected to neuronB)
         if (distFromEnd < u_swellFalloff) {
-            float influence = pow(1.0 - smoothstep(0.0, u_swellFalloff, distFromEnd), 2.0);
-            currentSwellFactor += u_neuronPulseStateEnd * influence;
+            float influence = pow(1.0 - smoothstep(0.0, u_swellFalloff, distFromEnd), 2.0); // 'influence' is redefined here, which is fine.
+            currentSwellFactor += (u_neuronPulseStateEnd * u_pulseInfluenceScale + u_endTension * u_tensionEffectScale) * influence;
         }
         
-        currentSwellFactor = clamp(currentSwellFactor, 0.0, 1.0);
+        currentSwellFactor = clamp(currentSwellFactor, 0.0, 1.0); // Ensure swell factor stays within reasonable bounds
 
         vec3 displacedPosition = position + normal * currentSwellFactor * u_swellIntensity;
         
@@ -960,7 +965,11 @@ function createAxon(neuronA, neuronB, color = 0x4488FF, radius = 0.025, useCurve
             u_neuronPulseStateEnd: { value: 0.0 },
             u_swellIntensity: { value: 0.22 }, 
             u_swellFalloff: { value: 0.20 },    
-            u_stretchIntensity: { value: 0.05 } 
+            u_stretchIntensity: { value: 0.05 },
+            u_startTension: { value: 0.0 }, 
+            u_endTension: { value: 0.0 },
+            u_tensionEffectScale: { value: 0.5 }, 
+            u_pulseInfluenceScale: { value: 1.0 }
         },
         vertexShader: axonVertexShader, 
         fragmentShader: axonFragmentShader, 
@@ -1122,6 +1131,29 @@ function createStarDust(count = 6000, color = 0xbbccff) { // Slightly reduced st
 
 createStarDust(); // Add star dust to the scene
 
+// Helper function to find the closest vertex index on a neuron's core mesh to a reference position
+function findClosestVertexIndex(targetNeuronCoreMesh, referencePositionVec3) {
+    const geometry = targetNeuronCoreMesh.geometry;
+    const positionAttribute = geometry.attributes.position;
+    const worldMatrix = targetNeuronCoreMesh.matrixWorld; // Use the coreMesh's world matrix
+    
+    let closestIndex = -1;
+    let minDistanceSq = Infinity;
+    const tempVertexPos = new THREE.Vector3(); // For calculations
+
+    for (let i = 0; i < positionAttribute.count; i++) {
+        tempVertexPos.fromBufferAttribute(positionAttribute, i); // Get local vertex position
+        tempVertexPos.applyMatrix4(worldMatrix); // Transform to world space
+        
+        const distanceSq = tempVertexPos.distanceToSquared(referencePositionVec3);
+        if (distanceSq < minDistanceSq) {
+            minDistanceSq = distanceSq;
+            closestIndex = i;
+        }
+    }
+    return closestIndex;
+}
+
 // --- Start of New Axon Connection Logic ---
 
 const NEIGHBOR_DISTANCE_THRESHOLD = 7.5; // You can tune this value
@@ -1187,6 +1219,43 @@ if (typeof neurons !== 'undefined' && Array.isArray(neurons)) {
                     neuronA.outgoingAxons.push(axonMesh);
                     neuronB.incomingAxons.push(axonMesh);
                     // This was part of the 'swelling' effect setup and needs to be maintained.
+
+                    // Calculate and store attachment vertex indices
+                    // For Neuron A: Find vertex closest to Neuron B's center
+                    axonMesh.neuronA_attachmentVertexIndex = findClosestVertexIndex(neuronA.coreMesh, neuronB.position);
+
+                    // For Neuron B: Find vertex closest to Neuron A's center
+                    axonMesh.neuronB_attachmentVertexIndex = findClosestVertexIndex(neuronB.coreMesh, neuronA.position);
+
+                    // Optional log for verification
+                    // console.log(`Axon between N${neuronA.uuid.substring(0,3)}... and N${neuronB.uuid.substring(0,3)}... attaches to v_idx ${axonMesh.neuronA_attachmentVertexIndex} on N_A and v_idx ${axonMesh.neuronB_attachmentVertexIndex} on N_B`);
+
+                    // --- Store Initial Attachment Positions ---
+                    const tempInitialPosVec3 = new THREE.Vector3(); // Helper Vector3
+
+                    // For Neuron A's attachment point
+                    // Ensure neuronA.coreMesh.matrixWorld is up to date for initial calculation
+                    neuronA.coreMesh.updateMatrixWorld(true); 
+                    tempInitialPosVec3.fromBufferAttribute(
+                        neuronA.coreMesh.geometry.attributes.position, // Source: neuronA's geometry position attribute
+                        axonMesh.neuronA_attachmentVertexIndex         // Index of the attachment vertex on neuronA
+                    );
+                    tempInitialPosVec3.applyMatrix4(neuronA.coreMesh.matrixWorld); // Transform to initial world space
+                    axonMesh.initialAttachmentPosA = tempInitialPosVec3.clone(); // Store on axonMesh
+
+                    // For Neuron B's attachment point
+                    // Ensure neuronB.coreMesh.matrixWorld is up to date
+                    neuronB.coreMesh.updateMatrixWorld(true); 
+                    tempInitialPosVec3.fromBufferAttribute(
+                        neuronB.coreMesh.geometry.attributes.position, // Source: neuronB's geometry position attribute
+                        axonMesh.neuronB_attachmentVertexIndex         // Index of the attachment vertex on neuronB
+                    );
+                    tempInitialPosVec3.applyMatrix4(neuronB.coreMesh.matrixWorld); // Transform to initial world space
+                    axonMesh.initialAttachmentPosB = tempInitialPosVec3.clone(); // Store on axonMesh
+
+                    // Optional: Log for verification
+                    // console.log(`Axon ${axonMesh.uuid.slice(0,3)}: InitPosA:`, axonMesh.initialAttachmentPosA, `InitPosB:`, axonMesh.initialAttachmentPosB);
+                    // --- End of Store Initial Attachment Positions ---
                 }
             }
         }
@@ -1195,12 +1264,297 @@ if (typeof neurons !== 'undefined' && Array.isArray(neurons)) {
 // --- End of New Axon Connection Logic ---
 
 //----------------------------------------------------------------------------------
+// TRANSFORM FEEDBACK (TF) SETUP AND EXECUTION
+//----------------------------------------------------------------------------------
+
+// Global/persistent TF variables
+let gl;
+let tfProgram;
+let tf_uTimeLocation, tf_uFrequencyLocation, tf_uAmplitudeLocation, tf_modelMatrixLocation;
+let tf_positionAttributeLocation, tf_normalAttributeLocation;
+let transformFeedbackObject; // Renamed from transformFeedback to avoid conflict
+let tfOutputBuffer;
+let neuronDisplacedVertexData = []; // Array to store Float32Array for each neuron
+
+// Shader sources (kept here for clarity for now, could be externalized)
+const tfNeuronVertexShaderSource = `
+    #version 300 es
+    precision highp float;
+
+    uniform float u_time;
+    uniform float u_frequency;
+    uniform float u_amplitude;
+    uniform mat4 modelMatrix;
+
+    // GLSL Noise (snoise function)
+    vec3 mod289(vec3 x) {
+        return x - floor(x * (1.0 / 289.0)) * 289.0;
+    }
+    vec4 mod289(vec4 x) {
+        return x - floor(x * (1.0 / 289.0)) * 289.0;
+    }
+    vec4 permute(vec4 x) {
+        return mod289(((x*34.0)+1.0)*x);
+    }
+    vec4 taylorInvSqrt(vec4 r) {
+        return 1.79284291400159 - 0.85373472090901 * r;
+    }
+    float snoise(vec3 v) {
+        const vec2 C = vec2(1.0/6.0, 1.0/3.0) ;
+        const vec4 D = vec4(0.0, 0.5, 1.0, 2.0);
+        vec3 i  = floor(v + dot(v, C.yyy) );
+        vec3 x0 =   v - i + dot(i, C.xxx) ;
+        vec3 g = step(x0.yzx, x0.xyz);
+        vec3 l = 1.0 - g;
+        vec3 i1 = min( g.xyz, l.zxy );
+        vec3 i2 = max( g.xyz, l.zxy );
+        vec3 x1 = x0 - i1 + C.xxx;
+        vec3 x2 = x0 - i2 + C.yyy; 
+        vec3 x3 = x0 - D.yyy;      
+        i = mod289(i);
+        vec4 p = permute( permute( permute(
+                    i.z + vec4(0.0, i1.z, i2.z, 1.0 ))
+                + i.y + vec4(0.0, i1.y, i2.y, 1.0 ))
+                + i.x + vec4(0.0, i1.x, i2.x, 1.0 ));
+        float n_ = 0.142857142857; 
+        vec3  ns = n_ * D.wyz - D.xzx;
+        vec4 j = p - 49.0 * floor(p * ns.z * ns.z);  
+        vec4 x_ = floor(j * ns.z);
+        vec4 y_ = floor(j - 7.0 * x_ );    
+        vec4 x = x_ *ns.x + ns.yyyy;
+        vec4 y = y_ *ns.x + ns.yyyy;
+        vec4 h = 1.0 - abs(x) - abs(y);
+        vec4 b0 = vec4( x.xy, y.xy );
+        vec4 b1 = vec4( x.zw, y.zw );
+        vec4 s0 = floor(b0)*2.0 + 1.0;
+        vec4 s1 = floor(b1)*2.0 + 1.0;
+        vec4 sh = -step(h, vec4(0.0));
+        vec4 a0 = b0.xzyw + s0.xzyw*sh.xxyy ;
+        vec4 a1 = b1.xzyw + s1.xzyw*sh.zzww ;
+        vec3 p0 = vec3(a0.xy,h.x);
+        vec3 p1 = vec3(a0.zw,h.y);
+        vec3 p2 = vec3(a1.xy,h.z);
+        vec3 p3 = vec3(a1.zw,h.w);
+        vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2,p2), dot(p3,p3)));
+        p0 *= norm.x;
+        p1 *= norm.y;
+        p2 *= norm.z;
+        p3 *= norm.w;
+        vec4 m = max(0.6 - vec4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0);
+        m = m * m;
+        return 42.0 * dot( m*m, vec4( dot(p0,x0), dot(p1,x1),
+                                        dot(p2,x2), dot(p3,x3) ) );
+    }
+
+    in vec3 position;
+    in vec3 normal;
+    out vec3 out_displacedWorldPosition;
+
+    void main() {
+        float noiseValue = snoise(position * u_frequency + u_time * 0.2); 
+        vec3 displacedLocalPosition = position + normal * noiseValue * u_amplitude;
+        out_displacedWorldPosition = (modelMatrix * vec4(displacedLocalPosition, 1.0)).xyz;
+        gl_Position = vec4(0.0, 0.0, 0.0, 1.0); // TF doesn't use gl_Position if RASTERIZER_DISCARD
+    }
+`;
+
+const tfFragmentShaderMinimalSource = `
+    #version 300 es
+    precision mediump float;
+    void main() {
+        // Outputting transparent black, not strictly necessary with RASTERIZER_DISCARD
+        // outColor is implicitly declared for WebGL2 fragment shaders if no other 'out' is present
+        // For clarity, explicitly: out vec4 outColor; outColor = vec4(0.0,0.0,0.0,0.0);
+    }
+`;
+
+function initTransformFeedback() {
+    console.log("Initializing Transform Feedback...");
+    gl = renderer.getContext();
+    if (!renderer.capabilities.isWebGL2) {
+        console.error("WebGL 2.0 is not available. Transform Feedback cannot be initialized.");
+        return false;
+    }
+    console.log("WebGL 2.0 Context obtained for Transform Feedback initialization.");
+
+    const tfVertexShader = compileShader(tfNeuronVertexShaderSource, gl.VERTEX_SHADER);
+    const tfFragmentShader = compileShader(tfFragmentShaderMinimalSource, gl.FRAGMENT_SHADER);
+
+    if (!tfVertexShader || !tfFragmentShader) {
+        console.error("TF Shader compilation failed. Aborting TF initialization.");
+        return false;
+    }
+
+    tfProgram = gl.createProgram();
+    gl.attachShader(tfProgram, tfVertexShader);
+    gl.attachShader(tfProgram, tfFragmentShader);
+
+    const varyings = ['out_displacedWorldPosition'];
+    gl.transformFeedbackVaryings(tfProgram, varyings, gl.SEPARATE_ATTRIBS);
+
+    gl.linkProgram(tfProgram);
+    if (!gl.getProgramParameter(tfProgram, gl.LINK_STATUS)) {
+        console.error('TF Program link error:', gl.getProgramInfoLog(tfProgram));
+        gl.deleteProgram(tfProgram);
+        gl.deleteShader(tfVertexShader);
+        gl.deleteShader(tfFragmentShader);
+        tfProgram = null; // Ensure tfProgram is null if linking failed
+        return false;
+    }
+    console.log("TF Program compiled and linked successfully.");
+
+    // Get uniform and attribute locations
+    tf_uTimeLocation = gl.getUniformLocation(tfProgram, "u_time");
+    tf_uFrequencyLocation = gl.getUniformLocation(tfProgram, "u_frequency");
+    tf_uAmplitudeLocation = gl.getUniformLocation(tfProgram, "u_amplitude");
+    tf_modelMatrixLocation = gl.getUniformLocation(tfProgram, "modelMatrix");
+    tf_positionAttributeLocation = gl.getAttribLocation(tfProgram, "position");
+    tf_normalAttributeLocation = gl.getAttribLocation(tfProgram, "normal");
+
+    // Create the Transform Feedback object
+    transformFeedbackObject = gl.createTransformFeedback();
+
+    // Create and allocate the output buffer (once)
+    // Assuming all neuron core meshes have the same vertex count.
+    // If not, this needs to be sized for the largest or dynamically resized (more complex).
+    if (neurons.length > 0 && neurons[0].coreMesh) {
+        const sampleGeometry = neurons[0].coreMesh.geometry;
+        const vertexCount = sampleGeometry.attributes.position.count;
+        const outputBufferSize = vertexCount * 3 * Float32Array.BYTES_PER_ELEMENT; // 3 floats (vec3) per vertex
+        
+        tfOutputBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, tfOutputBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, outputBufferSize, gl.STATIC_READ); // Usage: STATIC_READ as we read from it
+        gl.bindBuffer(gl.ARRAY_BUFFER, null);
+        console.log(`TF Output Buffer created with size: ${outputBufferSize} bytes for ${vertexCount} vertices.`);
+    } else {
+        console.error("Cannot create TF output buffer: no neurons available or neuron has no coreMesh.");
+        gl.deleteProgram(tfProgram); // Cleanup program if buffer init fails
+        tfProgram = null;
+        return false;
+    }
+    
+    // Shader objects can be deleted after linking
+    gl.deleteShader(tfVertexShader);
+    gl.deleteShader(tfFragmentShader);
+    
+    console.log("Transform Feedback Initialized Successfully.");
+    return true; // Indicate success
+}
+
+function updateAllNeuronTFData() {
+    if (!tfProgram || !gl) {
+        // console.warn("TF Program not initialized or WebGL context lost. Skipping TF update.");
+        return;
+    }
+
+    // Ensure matrixWorld is up-to-date for all neurons before TF pass
+    scene.updateMatrixWorld(true); // Force update of world matrices for all objects in scene
+
+    gl.useProgram(tfProgram);
+    gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, transformFeedbackObject);
+    gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, tfOutputBuffer); // Bind output buffer for each TF pass
+
+    gl.enable(gl.RASTERIZER_DISCARD);
+
+    neurons.forEach((neuron, index) => {
+        if (!neuron.coreMesh || !neuron.coreMesh.geometry) {
+            console.warn(`Neuron at index ${index} has no coreMesh or geometry. Skipping.`);
+            return;
+        }
+
+        const geometry = neuron.coreMesh.geometry;
+        const positionAttribute = geometry.attributes.position;
+        const normalAttribute = geometry.attributes.normal;
+        const vertexCount = positionAttribute.count;
+
+        // These buffers are created and filled for each neuron.
+        // For performance, if geometry is shared or attributes are from a single large buffer,
+        // this could be optimized by using offsets with bindBuffer and vertexAttribPointer.
+        // Given each neuron has its own geometry instance, this is necessary.
+        const glPositionBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, glPositionBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, positionAttribute.array, gl.STATIC_DRAW);
+        gl.enableVertexAttribArray(tf_positionAttributeLocation);
+        gl.vertexAttribPointer(tf_positionAttributeLocation, 3, gl.FLOAT, false, 0, 0);
+
+        const glNormalBuffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, glNormalBuffer);
+        gl.bufferData(gl.ARRAY_BUFFER, normalAttribute.array, gl.STATIC_DRAW);
+        gl.enableVertexAttribArray(tf_normalAttributeLocation);
+        gl.vertexAttribPointer(tf_normalAttributeLocation, 3, gl.FLOAT, false, 0, 0);
+
+        // Set uniforms
+        const coreUniforms = neuron.coreMaterial.uniforms;
+        gl.uniform1f(tf_uTimeLocation, coreUniforms.u_time.value); // Using neuron's own time
+        gl.uniform1f(tf_uFrequencyLocation, coreUniforms.u_frequency.value);
+        gl.uniform1f(tf_uAmplitudeLocation, coreUniforms.u_amplitude.value);
+        gl.uniformMatrix4fv(tf_modelMatrixLocation, false, neuron.coreMesh.matrixWorld.elements);
+        
+        // Execute TF
+        gl.beginTransformFeedback(gl.POINTS);
+        gl.drawArrays(gl.POINTS, 0, vertexCount);
+        gl.endTransformFeedback();
+
+        // Read back data for this neuron
+        if (!neuronDisplacedVertexData[index] || neuronDisplacedVertexData[index].length !== vertexCount * 3) {
+            neuronDisplacedVertexData[index] = new Float32Array(vertexCount * 3);
+        }
+        // Output buffer (tfOutputBuffer) is already bound to TRANSFORM_FEEDBACK_BUFFER.
+        // For getBufferSubData, it's good practice to bind to COPY_READ_BUFFER if available,
+        // but it will also work with the generic ARRAY_BUFFER target if it's already bound there.
+        // However, tfOutputBuffer was last bound to ARRAY_BUFFER for gl.bufferData, then to TRANSFORM_FEEDBACK_BUFFER.
+        // To be safe and explicit for getBufferSubData:
+        gl.bindBuffer(gl.COPY_READ_BUFFER, tfOutputBuffer);
+        gl.getBufferSubData(gl.COPY_READ_BUFFER, 0, neuronDisplacedVertexData[index]);
+        gl.bindBuffer(gl.COPY_READ_BUFFER, null); // Unbind from copy read target
+
+        // Cleanup neuron-specific buffers
+        gl.deleteBuffer(glPositionBuffer);
+        gl.deleteBuffer(glNormalBuffer);
+        gl.disableVertexAttribArray(tf_positionAttributeLocation);
+        gl.disableVertexAttribArray(tf_normalAttributeLocation);
+
+        // Optional: Log first few values for the first neuron each frame for debugging
+        // if (index === 0) {
+        //     console.log(`TF Data for Neuron 0 (frame ${renderer.info.render.frame}):`, neuronDisplacedVertexData[0].slice(0, 9));
+        // }
+    });
+
+    gl.disable(gl.RASTERIZER_DISCARD);
+    gl.bindTransformFeedback(gl.TRANSFORM_FEEDBACK, null);
+    gl.bindBufferBase(gl.TRANSFORM_FEEDBACK_BUFFER, 0, null);
+    gl.useProgram(null); // Clean up GL state
+}
+
+
+// Call the TF initialization function once after setup
+// Ensure neurons are initialized before calling
+if (neurons && neurons.length > 0) {
+    // Initialize neuronDisplacedVertexData array structure
+    for (let i = 0; i < neurons.length; i++) {
+        if (neurons[i].coreMesh && neurons[i].coreMesh.geometry.attributes.position) {
+            const numVertices = neurons[i].coreMesh.geometry.attributes.position.count;
+            neuronDisplacedVertexData.push(new Float32Array(numVertices * 3));
+        } else {
+            // Push a placeholder or handle error if neuron geometry isn't ready
+            neuronDisplacedVertexData.push(new Float32Array(0)); 
+            console.warn(`Neuron ${i} has no coreMesh or position attribute for TF data array setup.`);
+        }
+    }
+    initTransformFeedback(); // Initialize TF system
+} else {
+    console.warn("Neurons not initialized when TF init was scheduled.");
+}
+
+
+//----------------------------------------------------------------------------------
 // ANIMATION LOOP
 //----------------------------------------------------------------------------------
 const clock = new THREE.Clock(); // Clock for getting deltaTime
 const tempParticlePosition = new THREE.Vector3(); // Pre-allocate for particle updates
-const tempAxonPosA = new THREE.Vector3();
-const tempAxonPosB = new THREE.Vector3();
+const tempAxonPosA = new THREE.Vector3(); // Used in animateAxons
+const tempAxonPosB = new THREE.Vector3(); // Used in animateAxons
 const tempMidPoint = new THREE.Vector3();
 const tempDir = new THREE.Vector3();
 const tempPerpendicular = new THREE.Vector3();
@@ -1212,33 +1566,121 @@ const tempNormal = new THREE.Vector3();
 const tempBinormal = new THREE.Vector3();
 const tempTangent = new THREE.Vector3();
 const tempBasisMatrix = new THREE.Matrix4();
+const tempCurrentAttachmentPosA = new THREE.Vector3(); // For tension calculation
+const tempCurrentAttachmentPosB = new THREE.Vector3(); // For tension calculation
 
 
 function animate() {
-    requestAnimationFrame(animate); // Request the next frame for smooth animation.
+    requestAnimationFrame(animate); 
+    const deltaTime = clock.getDelta(); 
 
-    const deltaTime = clock.getDelta(); // Get time elapsed since last frame
-
-    // Update OrbitControls if enabled.
-    // controls.update() is required if controls.enableDamping or controls.autoRotate is set to true.
     if (controls) {
         controls.update();
     }
 
-    // Update each neuron (handles their pulsing animation and shader updates).
     neurons.forEach(neuron => {
-        neuron.update(deltaTime); // Pass deltaTime to neuron's update method
+        neuron.update(deltaTime); 
     });
 
-    const time = Date.now() * 0.0002; // Slow time factor for swaying
+    // Update Transform Feedback Data for all neurons each frame
+    if (renderer.capabilities.isWebGL2 && tfProgram) { // Ensure TF is initialized
+        updateAllNeuronTFData();
+    }
+    
+    // Example: Log data for the first axon's attachment points using the new TF data
+    // This is for debugging and would typically be part of axon update logic.
+    // if (axons.length > 0 && neuronDisplacedVertexData.length > 0) {
+    //     const firstAxon = axons[0];
+    //     const neuronAData = neuronDisplacedVertexData[neurons.indexOf(firstAxon.neuronA)];
+    //     const neuronBData = neuronDisplacedVertexData[neurons.indexOf(firstAxon.neuronB)];
+
+    //     if (neuronAData && neuronAData.length > firstAxon.neuronA_attachmentVertexIndex * 3) {
+    //         const idxA = firstAxon.neuronA_attachmentVertexIndex * 3;
+    //         // console.log(`Axon0 N_A attach point (world): ${neuronAData[idxA]}, ${neuronAData[idxA+1]}, ${neuronAData[idxA+2]}`);
+    //     }
+    //     if (neuronBData && neuronBData.length > firstAxon.neuronB_attachmentVertexIndex * 3) {
+    //         const idxB = firstAxon.neuronB_attachmentVertexIndex * 3;
+    //         // console.log(`Axon0 N_B attach point (world): ${neuronBData[idxB]}, ${neuronBData[idxB+1]}, ${neuronBData[idxB+2]}`);
+    //     }
+    // }
+
+
+    const time = Date.now() * 0.0002; 
     const swayAmount = 0.5; // Max sway displacement
 
     // Animate axon signals and particles
     axons.forEach(axon => {
+        // --- Axon Curve Update Logic based on TF Data ---
+        const neuronA = axon.neuronA;
+        const neuronB = axon.neuronB;
+        let tfDataValidForA = false;
+        let tfDataValidForB = false;
+
+        // Use pre-allocated temp vectors for current attachment positions
+        // tempCurrentAttachmentPosA and tempCurrentAttachmentPosB are declared globally
+
+        if (neuronA && neuronB && neuronDisplacedVertexData) {
+            const neuronADataIndex = neurons.indexOf(neuronA);
+            const neuronBDataIndex = neurons.indexOf(neuronB);
+
+            if (neuronADataIndex !== -1 && axon.neuronA_attachmentVertexIndex !== undefined) {
+                const positionsA = neuronDisplacedVertexData[neuronADataIndex];
+                if (positionsA && positionsA.length > axon.neuronA_attachmentVertexIndex * 3) {
+                    tempCurrentAttachmentPosA.fromArray(positionsA, axon.neuronA_attachmentVertexIndex * 3);
+                    tfDataValidForA = true;
+                }
+            }
+
+            if (neuronBDataIndex !== -1 && axon.neuronB_attachmentVertexIndex !== undefined) {
+                const positionsB = neuronDisplacedVertexData[neuronBDataIndex];
+                if (positionsB && positionsB.length > axon.neuronB_attachmentVertexIndex * 3) {
+                    tempCurrentAttachmentPosB.fromArray(positionsB, axon.neuronB_attachmentVertexIndex * 3);
+                    tfDataValidForB = true;
+                }
+            }
+        }
+        
+        // If TF data wasn't available, fall back to neuron center positions
+        if (!tfDataValidForA) {
+            tempCurrentAttachmentPosA.copy(neuronA.position); 
+        }
+        if (!tfDataValidForB) {
+            tempCurrentAttachmentPosB.copy(neuronB.position); 
+        }
+        
+        // --- Calculate Axon Tension ---
+        if (axon.initialAttachmentPosA && axon.initialAttachmentPosB) {
+            axon.startTension = tempCurrentAttachmentPosA.distanceTo(axon.initialAttachmentPosA);
+            axon.endTension = tempCurrentAttachmentPosB.distanceTo(axon.initialAttachmentPosB);
+
+            // Optional: Log for verification for one axon
+            // if (axon === axons[0]) {
+            //    console.log(`Axon ${axon.uuid.slice(0,3)}: StartTension: ${axon.startTension.toFixed(3)}, EndTension: ${axon.endTension.toFixed(3)}`);
+            //    console.log("Initial A:", axon.initialAttachmentPosA, "Current A:", newStartPos);
+            //    console.log("Initial B:", axon.initialAttachmentPosB, "Current B:", newEndPos);
+            // }
+        } else {
+            // Initialize tension if initial attachment positions are missing (should not happen if setup is correct)
+            axon.startTension = 0.0;
+            axon.endTension = 0.0;
+        }
+        
+        // Update shader uniforms with calculated tension
+        if (axon.material && axon.material.isShaderMaterial) {
+            if (axon.material.uniforms.u_startTension) {
+                axon.material.uniforms.u_startTension.value = axon.startTension;
+            }
+            if (axon.material.uniforms.u_endTension) {
+                axon.material.uniforms.u_endTension.value = axon.endTension;
+            }
+        }
+        // --- End of Calculate Axon Tension ---
+
         // --- Animate Axon Sway (Option A: JS Curve Update) ---
-        if (axon.neuronA && axon.neuronB && axon.initialControlPointOffset) {
-            tempAxonPosA.copy(axon.neuronA.position);
-            tempAxonPosB.copy(axon.neuronB.position);
+        // The sway logic now uses tempCurrentAttachmentPosA and tempCurrentAttachmentPosB
+        if (axon.neuronA && axon.neuronB && axon.initialControlPointOffset) { // Handles curved axons
+            tempAxonPosA.copy(tempCurrentAttachmentPosA); // Use the (potentially TF-derived) current start
+            tempAxonPosB.copy(tempCurrentAttachmentPosB); // Use the (potentially TF-derived) current end
             
             // Recalculate midpoint
             tempMidPoint.addVectors(tempAxonPosA, tempAxonPosB).multiplyScalar(0.5);
@@ -1256,6 +1698,19 @@ function animate() {
             // Create new curve for this frame
             const newCurve = new THREE.QuadraticBezierCurve3(tempAxonPosA, tempAnimatedControlPoint, tempAxonPosB);
             
+            // Update axon.particleSystem.curve (used for particle pathing)
+            if (axon.particleSystem && axon.particleSystem.curve instanceof THREE.QuadraticBezierCurve3) {
+                axon.particleSystem.curve.v0.copy(newCurve.v0);
+                axon.particleSystem.curve.v1.copy(newCurve.v1);
+                axon.particleSystem.curve.v2.copy(newCurve.v2);
+            } else if (axon.particleSystem && axon.particleSystem.curve instanceof THREE.LineCurve3) {
+                // This case might occur if straight axons were created with LineCurve3,
+                // though current createAxon uses QuadraticBezierCurve3 for all.
+                axon.particleSystem.curve.v0.copy(newCurve.v0); // or tempAxonPosA
+                axon.particleSystem.curve.v1.copy(newCurve.v2); // or tempAxonPosB (LineCurve3 has v0 and v1 as start/end)
+            }
+
+
             // Update geometry attributes
             const positions = axon.geometry.attributes.position;
             const normals = axon.geometry.attributes.normal;
@@ -1314,9 +1769,9 @@ function animate() {
         // If you want to keep it as a subtle background effect on axons, it could be reinstated here,
         // but the primary signal is now the shader-driven orb.
 
-        // Animate particle system (remains the same)
+            // Update particle system
         if (axon.particleSystem) {
-            const ps = axon.particleSystem;
+                const ps = axon.particleSystem; // ps.curve is now updated above
             const positionsAttribute = ps.pointsMesh.geometry.getAttribute('position');
             const alphaAttribute = ps.pointsMesh.geometry.getAttribute('customAlpha');
             // const sizeAttribute = ps.pointsMesh.geometry.getAttribute('customSize'); // If size needs animation
