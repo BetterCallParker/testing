@@ -106,28 +106,8 @@ const axonVertexShader = `
 
         vec3 displacedPosition = position + normal * currentSwellFactor * u_swellIntensity;
         
-        gl_Position = projectionMatrix * modelViewMatrix * vec4(displacedPosition, 1.0);
-            // This is a simplification; true tangent would be better but harder to get here without more attributes.
-            // We'll use a simple heuristic: pull "away" from the neuron.
-            // Since vUv.y = 0 is start, we want to displace in -Z direction of the tube segment IF Three.js orients tubes this way.
-            // However, our custom tube is built along curve tangents. Displacement along 'normal' is radial.
-            // For stretch, we'd ideally want to displace the *connection point itself* further from neuron center,
-            // or displace vertices near connection point along axon tangent.
-            // Given current setup, a simple radial swell is more robust. Let's enhance that.
-        }
-
-        // Swelling and Stretching at the END of the axon (connected to neuronB)
-        if (distFromEnd < u_swellFalloff) {
-            float influence = pow(1.0 - smoothstep(0.0, u_swellFalloff, distFromEnd), 2.0);
-            currentSwellFactor += u_neuronPulseStateEnd * influence;
-        }
-        
-        currentSwellFactor = clamp(currentSwellFactor, 0.0, 1.0);
-
-        vec3 displacedPosition = position + normal * currentSwellFactor * u_swellIntensity;
-        
         // Attempt at a "stretch" by moving points near neuron along the view vector (crude approximation of pulling)
-        // This is highly experimental and might not look right.
+        // This is highly experimental and might not look right and was previously part of the duplicate block.
         // if (distFromStart < u_swellFalloff) {
         //    displacedPosition += normalize(cameraPosition - (modelMatrix * vec4(position,1.0)).xyz) * u_neuronPulseStateStart * u_stretchIntensity * (1.0 - distFromStart/u_swellFalloff) ;
         // }
@@ -137,6 +117,14 @@ const axonVertexShader = `
         // Sticking to enhanced radial swell for now.
 
         gl_Position = projectionMatrix * modelViewMatrix * vec4(displacedPosition, 1.0);
+            // The following comments were originally associated with the first gl_Position assignment.
+            // This is a simplification; true tangent would be better but harder to get here without more attributes.
+            // We'll use a simple heuristic: pull "away" from the neuron.
+            // Since vUv.y = 0 is start, we want to displace in -Z direction of the tube segment IF Three.js orients tubes this way.
+            // However, our custom tube is built along curve tangents. Displacement along 'normal' is radial.
+            // For stretch, we'd ideally want to displace the *connection point itself* further from neuron center,
+            // or displace vertices near connection point along axon tangent.
+            // Given current setup, a simple radial swell is more robust. Let's enhance that.
     }
 `;
 
@@ -858,6 +846,7 @@ function createAxon(neuronA, neuronB, color = 0x4488FF, radius = 0.025, useCurve
 
     // 1. Define the curve (path of the axon)
     let curve;
+    let controlPoint; // Declare controlPoint here
     if (useCurve) {
         const distance = posA.distanceTo(posB);
         const midPoint = new THREE.Vector3().addVectors(posA, posB).multiplyScalar(0.5);
@@ -879,7 +868,7 @@ function createAxon(neuronA, neuronB, color = 0x4488FF, radius = 0.025, useCurve
         // Add a slight upward bias to the control point to make curves feel more "grown"
         controlPointOffset.y += distance * 0.1 * Math.random(); 
 
-        const controlPoint = midPoint.clone().add(controlPointOffset);
+        controlPoint = midPoint.clone().add(controlPointOffset); // Assign to the higher-scoped controlPoint
         curve = new THREE.QuadraticBezierCurve3(posA, controlPoint, posB);
     } else {
         curve = new THREE.LineCurve3(posA, posB);
@@ -993,8 +982,10 @@ function createAxon(neuronA, neuronB, color = 0x4488FF, radius = 0.025, useCurve
     axonMesh.neuronB = neuronB;
     // Store the original offset direction and magnitude factor for consistent curve shape
     // The controlPointOffset vector itself is relative to the midpoint and captures the initial "bend" direction and strength
-    const initialMidPoint = new THREE.Vector3().addVectors(posA, posB).multiplyScalar(0.5);
-    axonMesh.initialControlPointOffset = controlPoint.clone().sub(initialMidPoint); // Store the calculated offset
+    if (useCurve && controlPoint) { // Check if controlPoint was defined
+        const initialMidPoint = new THREE.Vector3().addVectors(posA, posB).multiplyScalar(0.5);
+        axonMesh.initialControlPointOffset = controlPoint.clone().sub(initialMidPoint); // Store the calculated offset
+    }
     axonMesh.swaySeed = Math.random() * 1000; // For desynchronized swaying
 
     // Store segments for geometry updates
@@ -1026,7 +1017,7 @@ function createAxon(neuronA, neuronB, color = 0x4488FF, radius = 0.025, useCurve
 
     // Particle color will be derived from the axon's signal color (which comes from neuron core)
     // Make it related but less intense than the main signal orb.
-    const particleColorForThisAxon = axonMesh.signalColor.clone().multiplyScalar(0.6).lerp(new THREE.Color(0xffffff), 0.2); 
+    const particleColorForThisAxon = axonMesh.signalColor.clone().multiplyScalar(0.7).lerp(new THREE.Color(0xffffff), 0.1); 
 
     const particleMaterial = new THREE.ShaderMaterial({
         uniforms: {
@@ -1131,27 +1122,77 @@ function createStarDust(count = 6000, color = 0xbbccff) { // Slightly reduced st
 
 createStarDust(); // Add star dust to the scene
 
-// Define connections between neurons and populate outgoingAxons arrays.
-if (neurons.length >= 6) { 
-    const connections = [
-        [0, 1], [0, 2], [1, 3], [2, 4], [3, 5], [4, 5],
-        [1, 4, 0x66AAFF, 0.02], [0, 5, 0x5599FF, 0.022] // Examples with custom color/radius
-    ];
+// --- Start of New Axon Connection Logic ---
 
-    connections.forEach(conn => {
-        const n1 = neurons[conn[0]];
-        const n2 = neurons[conn[1]];
-        const axonColor = conn[2] ? conn[2] : undefined; // Use default if not specified
-        const axonRadius = conn[3] ? conn[3] : undefined;
-        
-        if (n1 && n2) {
-            const axon = createAxon(n1, n2, axonColor, axonRadius, true);
-            axons.push(axon);
-            n1.outgoingAxons.push(axon); 
-            n2.incomingAxons.push(axon); // Populate incoming axons for neuron n2
+const NEIGHBOR_DISTANCE_THRESHOLD = 7.5; // You can tune this value
+
+// Clear any existing axons from scene and memory
+// (Assuming 'axons' is a global or accessible array holding axon meshes,
+// and 'scene' is your THREE.Scene instance)
+if (typeof axons !== 'undefined' && Array.isArray(axons)) {
+    axons.forEach(axon => {
+        if (axon.particleSystem) {
+            if (axon.particleSystem.pointsMesh) { // Corrected from axon.particleSystem.mesh
+                scene.remove(axon.particleSystem.pointsMesh);
+            }
+            if (axon.particleSystem.curve && axon.particleSystem.pointsMesh) { // Check if geometry and material exist on pointsMesh
+               if (axon.particleSystem.pointsMesh.geometry) {
+                   axon.particleSystem.pointsMesh.geometry.dispose();
+               }
+               if (axon.particleSystem.pointsMesh.material) {
+                   axon.particleSystem.pointsMesh.material.dispose();
+               }
+            }
+        }
+        scene.remove(axon);
+        if (axon.geometry) {
+            axon.geometry.dispose();
+        }
+        if (axon.material) {
+            // If axon.material is an array (multi-material), iterate and dispose
+            if (Array.isArray(axon.material)) {
+                axon.material.forEach(mat => mat.dispose());
+            } else {
+                axon.material.dispose();
+            }
         }
     });
+    axons.length = 0; // Reset the array
+} else {
+    // If 'axons' wasn't defined, define it now
+    window.axons = []; // Or scope it appropriately if not global. The file already defines 'const axons = []' so this path might not be hit.
 }
+
+// Clear existing axon references from neurons
+// (Assuming 'neurons' is an array of your Neuron objects)
+if (typeof neurons !== 'undefined' && Array.isArray(neurons)) {
+    neurons.forEach(neuron => {
+        neuron.outgoingAxons = [];
+        neuron.incomingAxons = [];
+    });
+
+    // Create new axons based on neighbors
+    for (let i = 0; i < neurons.length; i++) {
+        for (let j = i + 1; j < neurons.length; j++) { // j = i + 1 prevents self-conn & duplicates
+            const neuronA = neurons[i];
+            const neuronB = neurons[j];
+            const distance = neuronA.position.distanceTo(neuronB.position);
+
+            if (distance <= NEIGHBOR_DISTANCE_THRESHOLD) {
+                // Assuming 'createAxon' is your existing function that returns an axon mesh
+                const axonMesh = createAxon(neuronA, neuronB); // Using default color/radius for now
+                if (axonMesh) {
+                    axons.push(axonMesh); 
+                    // Ensure createAxon or logic here correctly populates:
+                    neuronA.outgoingAxons.push(axonMesh);
+                    neuronB.incomingAxons.push(axonMesh);
+                    // This was part of the 'swelling' effect setup and needs to be maintained.
+                }
+            }
+        }
+    }
+}
+// --- End of New Axon Connection Logic ---
 
 //----------------------------------------------------------------------------------
 // ANIMATION LOOP
